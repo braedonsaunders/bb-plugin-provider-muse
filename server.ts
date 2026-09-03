@@ -53,12 +53,13 @@ export default function plugin(bb: BbPluginApi) {
         "Start Muse sessions with the workspace trusted so its AGENTS.md, skills, and rules load.",
       default: true,
     },
-    disableSandbox: {
-      type: "boolean",
-      label: "Disable Muse's own sandbox",
+    sandbox: {
+      type: "select",
+      label: "Muse's own OS sandbox",
       description:
-        "Muse sandboxes shell filesystem and network access by default. Turning this off hands sandboxing entirely to BB's own permission modes.",
-      default: false,
+        "Off by default: Muse's sandbox is all-or-nothing and denies the Darwin per-user cache, so with it on no Swift or Clang compilation works — a two-line file fails to build. BB's permission modes and approvals are the enforcement surface instead. Turn it on for extra containment if your work needs no native toolchain. Full access disables it either way.",
+      options: ["off", "on"],
+      default: "off",
     },
     sandboxNetwork: {
       type: "select",
@@ -107,7 +108,7 @@ export default function plugin(bb: BbPluginApi) {
     deriveProviderOptions(context): MuseProviderOptions {
       return {
         trustWorkspace: context.settings.trustWorkspace !== false,
-        disableSandbox: context.settings.disableSandbox === true,
+        sandbox: context.settings.sandbox === "on" ? "on" : "off",
         sandboxNetwork:
           context.settings.sandboxNetwork === "proxy-only"
             ? "proxy-only"

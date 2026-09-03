@@ -34,6 +34,19 @@ it stays warm for a minute after the last thread detaches.
 | subagents | `subagent` items → delegation rows |
 | bb's injected tools | an MCP server the bridge proxies back to bb |
 
+## Why Muse's OS sandbox defaults to off
+
+Muse's sandbox is all or nothing: `muse serve` offers `--disable-sandbox` and no
+way to grant a path. It denies the Darwin per-user cache, and that alone means
+no Swift or Clang compilation works under it — a two-line `swiftc` file fails
+with `ModuleCache/…pcm: 'Operation not permitted'`. Swift macros cannot start
+their plugin server, and `xcodebuild` loses its XPC services on top.
+
+Codex ships a sandbox too, but a tuned one that grants the workspace and
+`$TMPDIR`; Muse's cannot be tuned. Inside bb the enforcement surface is bb's own
+permission modes and approval flow, so this plugin leaves the OS sandbox off and
+offers it as a setting for work that needs no native toolchain.
+
 ## Why the network sandbox defaults to on
 
 Muse sandboxes shell network access as `proxy-only` by default. Inside bb that
@@ -110,7 +123,7 @@ the installer for you.
 | Rolling 5-hour token budget | Tokens your plan allows per rolling window. Enables the usage meter. |
 | Plan label | How the subscription is labelled in usage surfaces. |
 | Load workspace skills and rules | Starts sessions with the workspace trusted. |
-| Disable Muse's own sandbox | Hands sandboxing entirely to BB's permission modes. |
+| Muse's own OS sandbox | `off` by default — see below. |
 | Sandbox network | `enabled` (default here), `proxy-only`, or `restricted`. See below. |
 
 ## Usage reporting

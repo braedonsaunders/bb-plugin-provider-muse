@@ -244,12 +244,24 @@ async function runInjectedTool(call: {
   };
 }
 
+/**
+ * Muse's OS sandbox is all or nothing — `muse serve` offers `--disable-sandbox`
+ * and nothing that grants a path — and it denies the Darwin per-user cache, so
+ * under it no Swift or Clang compilation works at all: a two-line file fails on
+ * `ModuleCache/…pcm: Operation not permitted`, Swift macros cannot start their
+ * plugin server, and xcodebuild loses its XPC services. Codex's sandbox is tuned
+ * for this (it grants TMPDIR and the workspace); Muse's cannot be.
+ *
+ * bb's permission modes and approval flow are the enforcement surface inside bb,
+ * so the OS sandbox stays off unless the user asks for it, and full access turns
+ * it off regardless.
+ */
 function postureFrom(
   options: MuseProviderOptions,
   policy: PermissionPolicy,
 ): HostPosture {
   return {
-    disableSandbox: options.disableSandbox === true || fullAccess(policy),
+    disableSandbox: options.sandbox !== "on" || fullAccess(policy),
     sandboxNetwork: options.sandboxNetwork ?? "enabled",
     trustWorkspace: options.trustWorkspace !== false,
   };

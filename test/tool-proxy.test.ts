@@ -215,3 +215,16 @@ describe("muse serve arguments", () => {
     }
   });
 });
+
+describe("sandbox posture", () => {
+  it("keeps Muse's OS sandbox off unless it is asked for", async () => {
+    const { museProviderOptionsSchema } = await import("../src/vocabulary.js");
+    expect(museProviderOptionsSchema.parse({}).sandbox).toBeUndefined();
+    expect(
+      museProviderOptionsSchema.parse({ sandbox: "on" }).sandbox,
+    ).toBe("on");
+    expect(museProviderOptionsSchema.safeParse({ sandbox: "yes" }).success).toBe(
+      false,
+    );
+  });
+});

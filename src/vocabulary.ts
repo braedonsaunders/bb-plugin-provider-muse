@@ -33,7 +33,7 @@ export const MUSE_USAGE_WINDOW_HOURS = 5;
 
 export const museProviderOptionsSchema = z.object({
   trustWorkspace: z.boolean().optional(),
-  disableSandbox: z.boolean().optional(),
+  sandbox: z.enum(["off", "on"]).optional(),
   sandboxNetwork: z.enum(["enabled", "proxy-only", "restricted"]).optional(),
   tokenBudget: z.number().int().positive().nullable().optional(),
   planLabel: z.string().min(1).nullable().optional(),
