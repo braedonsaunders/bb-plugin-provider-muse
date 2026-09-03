@@ -198,3 +198,20 @@ describe("tool proxy endpoint", () => {
     }
   });
 });
+
+describe("muse serve arguments", () => {
+  it("passes only sandbox-network values muse accepts", async () => {
+    const { museProviderOptionsSchema } = await import("../src/vocabulary.js");
+    for (const value of ["enabled", "proxy-only", "restricted"]) {
+      expect(
+        museProviderOptionsSchema.safeParse({ sandboxNetwork: value }).success,
+      ).toBe(true);
+    }
+    /** `on`/`off` read naturally but Muse rejects them and the host exits 2. */
+    for (const value of ["on", "off"]) {
+      expect(
+        museProviderOptionsSchema.safeParse({ sandboxNetwork: value }).success,
+      ).toBe(false);
+    }
+  });
+});

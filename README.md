@@ -34,6 +34,22 @@ it stays warm for a minute after the last thread detaches.
 | subagents | `subagent` items → delegation rows |
 | bb's injected tools | an MCP server the bridge proxies back to bb |
 
+## Why the network sandbox defaults to on
+
+Muse sandboxes shell network access as `proxy-only` by default. Inside bb that
+breaks the thing bb tells every agent to use: the `bb` CLI talks to bb's local
+server over loopback HTTP, and under proxy-only the larger responses —
+`bb thread log`, `bb thread show`, `bb thread tell` against a busy thread — die
+with `fetch failed: other side closed` while small ones such as `bb status`
+survive.
+
+That failure mode is worse than it sounds. A `bb thread tell` that is cut on the
+response leg has already been accepted by the server, so the agent sees a
+failure, retries, and the target thread receives the same message several times.
+
+BB threads therefore run with `--sandbox-network enabled`. The filesystem sandbox is
+untouched, and the setting still offers `proxy-only` and `off`.
+
 ## bb's session instructions
 
 bb tells every agent how to behave inside it — that the `bb` CLI is there, that
@@ -95,7 +111,7 @@ the installer for you.
 | Plan label | How the subscription is labelled in usage surfaces. |
 | Load workspace skills and rules | Starts sessions with the workspace trusted. |
 | Disable Muse's own sandbox | Hands sandboxing entirely to BB's permission modes. |
-| Sandbox network | `proxy-only` (Muse default), `on`, or `off`. |
+| Sandbox network | `enabled` (default here), `proxy-only`, or `restricted`. See below. |
 
 ## Usage reporting
 

@@ -64,9 +64,9 @@ export default function plugin(bb: BbPluginApi) {
       type: "select",
       label: "Sandbox network",
       description:
-        "Network posture for sandboxed Muse shell commands. Fixed for the lifetime of a Muse host process.",
-      options: ["proxy-only", "on", "off"],
-      default: "proxy-only",
+        "Network posture for sandboxed Muse shell commands. Muse's own default, proxy-only, truncates larger loopback responses and breaks the `bb` CLI that BB tells agents to use, so BB threads allow network by default. Fixed for the lifetime of a Muse host process.",
+      options: ["enabled", "proxy-only", "restricted"],
+      default: "enabled",
     },
   });
 
@@ -109,11 +109,11 @@ export default function plugin(bb: BbPluginApi) {
         trustWorkspace: context.settings.trustWorkspace !== false,
         disableSandbox: context.settings.disableSandbox === true,
         sandboxNetwork:
-          context.settings.sandboxNetwork === "on"
-            ? "on"
-            : context.settings.sandboxNetwork === "off"
-              ? "off"
-              : "proxy-only",
+          context.settings.sandboxNetwork === "proxy-only"
+            ? "proxy-only"
+            : context.settings.sandboxNetwork === "restricted"
+              ? "restricted"
+              : "enabled",
         tokenBudget: parseTokenBudget(context.settings.windowTokenBudget),
         planLabel: nonEmptyStringOrNull(context.settings.planLabel),
       };

@@ -143,7 +143,7 @@ function sendRuntimeRequest(
 
 interface HostPosture {
   disableSandbox: boolean;
-  sandboxNetwork: "proxy-only" | "off" | "on";
+  sandboxNetwork: "enabled" | "proxy-only" | "restricted";
   trustWorkspace: boolean;
 }
 
@@ -250,7 +250,7 @@ function postureFrom(
 ): HostPosture {
   return {
     disableSandbox: options.disableSandbox === true || fullAccess(policy),
-    sandboxNetwork: options.sandboxNetwork ?? "proxy-only",
+    sandboxNetwork: options.sandboxNetwork ?? "enabled",
     trustWorkspace: options.trustWorkspace !== false,
   };
 }
