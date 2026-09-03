@@ -13,7 +13,6 @@ import {
   decodeBridgeJsonRpcResponse,
   decodeToolCallResponsePayload,
   experimental_buildBridgeToolCallContent as buildBridgeToolCallContent,
-  experimental_BridgeRecoveryError as BridgeRecoveryError,
   experimental_defineProviderBridge,
   initializeParamsSchema,
   isStandaloneBuiltinCompactCommand,
@@ -33,18 +32,24 @@ import {
   turnSteerParamsSchema,
   withoutBridgeRuntimeEnv,
   type AvailableModel,
+  type BridgeExecutionOptions,
   type DynamicTool,
   type PendingInteractionResolution,
   type PromptInput,
   type ThreadDelta,
 } from "@get-bb/plugin-sdk/provider-bridge";
-import { z } from "zod";
 import {
   approvalPayloadFromMsp,
   chooseApprovalChoiceId,
   userInputSettlementFromResolution,
   userQuestionPayloadFromMsp,
 } from "./interactions.js";
+import {
+  getMuseInstallationRun,
+  getMuseInstallationStatus,
+  getMuseProviderHealth,
+  getMuseProviderUsage,
+} from "./maintenance.js";
 import {
   createMspConnection,
   MspExitedError,
@@ -53,7 +58,6 @@ import {
   type MspExitInfo,
 } from "./msp/connection.js";
 import { museExecutable } from "./msp/paths.js";
-import { uuidV7 } from "./msp/uuid.js";
 import {
   MSP_METHODS,
   mspApprovalRequestParamsSchema,
@@ -65,7 +69,6 @@ import {
   mspSessionResumeResultSchema,
   mspSessionStartResultSchema,
   mspTurnInterruptResultSchema,
-  mspTurnCompletedParamsSchema,
   mspTurnStartResultSchema,
   mspTurnSteerResultSchema,
   mspUserInputRequestParamsSchema,
@@ -73,20 +76,24 @@ import {
   type MspModelCatalogEntry,
   type MspUserInputRequestParams,
 } from "./msp/schemas.js";
+import { uuidV7 } from "./msp/uuid.js";
+import { classifyTurnFailure } from "./recovery.js";
 import {
-  getMuseInstallationRun,
-  getMuseInstallationStatus,
-  getMuseProviderHealth,
-  getMuseProviderUsage,
-  readMuseCredentials,
-} from "./maintenance.js";
+  constructionSignature,
+  createRuntime,
+  noteOutboundDeltas,
+  waitForTurnSettlement,
+  type HostPosture,
+  type MuseAttachment,
+  type MuseRuntime,
+  type SessionConstruction,
+} from "./session.js";
 import { prepareMuseConfigHome } from "./tool-proxy/config-home.js";
 import {
   startToolProxyEndpoint,
   type ToolProxyEndpoint,
 } from "./tool-proxy/endpoint.js";
 import { MUSE_TOOL_PROXY_SCRIPT } from "./tool-proxy/script.js";
-import { MuseTranslator } from "./translate.js";
 import {
   MUSE_DEFAULT_REASONING_LEVEL,
   MUSE_REASONING_EFFORTS,
@@ -99,18 +106,18 @@ import {
 const CLIENT_NAME = "bb";
 const CLIENT_VERSION = "1";
 const HANDSHAKE_TIMEOUT_MS = 30_000;
-/**
- * One `muse serve` process hosts every session that shares its sandbox posture.
- *
- * A session's route belongs to its host process, and Muse cannot replay its own
- * encrypted reasoning across a route change, so recycling a host under a thread
- * that is merely idle between turns is what breaks long-running work. The host
- * therefore outlives ordinary idleness by a wide margin and is reclaimed only
- * when a thread is genuinely done with it.
- */
-const HOST_IDLE_SHUTDOWN_MS = 30 * 60_000;
 const COMMAND_TIMEOUT_MS = 120_000;
 const INTERRUPT_SETTLE_TIMEOUT_MS = 8_000;
+const ZERO_WORK_SETTLEMENT_GRACE_MS = 1_500;
+
+/**
+ * A Muse session's route belongs to the process that opened it, and Muse cannot
+ * replay its own encrypted reasoning across a route change. Codex kills its
+ * child on release because it can resume a rollout cleanly; Muse cannot, so a
+ * thread's child outlives ordinary release and is reclaimed only when bb is
+ * plainly done with the thread.
+ */
+const ATTACHMENT_IDLE_SHUTDOWN_MS = 30 * 60_000;
 
 type JsonRpcId = string | number;
 type OutboundMessage = { jsonrpc: "2.0" } & Record<string, unknown>;
@@ -119,13 +126,6 @@ const io = createBridgeIo<OutboundMessage>();
 
 function notify(method: string, params: Record<string, unknown>): void {
   io.send({ jsonrpc: "2.0", method, params });
-}
-
-function emitDeltas(threadId: string, deltas: readonly ThreadDelta[]): void {
-  if (deltas.length === 0) {
-    return;
-  }
-  notify(THREAD_DELTA_NOTIFICATION_METHOD, { threadId, deltas });
 }
 
 let outboundRequestCounter = 0;
@@ -146,64 +146,172 @@ function sendRuntimeRequest(
   });
 }
 
-interface HostPosture {
-  disableSandbox: boolean;
-  sandboxNetwork: "enabled" | "proxy-only" | "restricted";
-  trustWorkspace: boolean;
+const attachments = new Map<string, MuseAttachment>();
+const attachmentsBySessionId = new Map<string, MuseAttachment>();
+let runtimeSerialCounter = 0;
+
+let bridgeDataDir: string | null = null;
+let toolProxy: ToolProxyEndpoint | null = null;
+let toolProxyScriptPath: string | null = null;
+let maintenanceConnection: MspConnection | null = null;
+let maintenanceConnectionPromise: Promise<MspConnection> | null = null;
+
+/**
+ * Drops a callback whose runtime has already been replaced, so a late reply can
+ * never mutate the session that took its place.
+ */
+function liveRuntime(threadId: string, serial: number): MuseRuntime | null {
+  const runtime = attachments.get(threadId)?.runtime ?? null;
+  if (runtime === null || runtime.serial !== serial || runtime.closing) {
+    return null;
+  }
+  return runtime;
 }
 
-interface MuseHost {
-  signature: string;
-  connection: MspConnection;
-  ready: Promise<void>;
-  museHome: string | null;
-  serverVersion: string | null;
-  threadIds: Set<string>;
-  idleTimer: NodeJS.Timeout | null;
+/**
+ * `thread/identity` precedes every delta for a session, so deltas produced
+ * before the identity is known wait for it rather than racing it.
+ */
+function emitDeltas(
+  attachment: MuseAttachment,
+  deltas: readonly ThreadDelta[],
+): void {
+  if (deltas.length === 0) {
+    return;
+  }
+  if (attachment.runtime !== null) {
+    noteOutboundDeltas(attachment.runtime, deltas);
+  }
+  if (!attachment.identityAnnounced) {
+    attachment.pendingPreIdentityDeltas.push(...deltas);
+    return;
+  }
+  notify(THREAD_DELTA_NOTIFICATION_METHOD, {
+    threadId: attachment.threadId,
+    deltas,
+  });
 }
 
-interface MuseSession {
-  threadId: string;
-  sessionId: string;
-  host: MuseHost;
+function announceIdentity(
+  attachment: MuseAttachment,
+  providerThreadId: string,
+): void {
+  if (
+    attachment.providerSessionId !== null &&
+    attachment.providerSessionId !== providerThreadId
+  ) {
+    attachmentsBySessionId.delete(attachment.providerSessionId);
+  }
+  attachment.providerSessionId = providerThreadId;
+  attachmentsBySessionId.set(providerThreadId, attachment);
+  if (attachment.identityAnnounced) {
+    return;
+  }
+  attachment.identityAnnounced = true;
+  notify(BRIDGE_NOTIFICATION_METHODS.threadIdentity, {
+    threadId: attachment.threadId,
+    providerThreadId,
+    sessionRestorable: true,
+  });
+  const buffered = attachment.pendingPreIdentityDeltas;
+  attachment.pendingPreIdentityDeltas = [];
+  if (buffered.length > 0) {
+    notify(THREAD_DELTA_NOTIFICATION_METHOD, {
+      threadId: attachment.threadId,
+      deltas: buffered,
+    });
+  }
+}
+
+function sessionStateDelta(attachment: MuseAttachment): ThreadDelta {
+  const runtime = attachment.runtime;
+  return {
+    kind: "extension.state",
+    extensionKind: MUSE_SESSION_EXTENSION_KIND,
+    payload: {
+      approvalMode: runtime?.approvalMode ?? null,
+      modelId: runtime?.modelId ?? null,
+      museHome: runtime?.museHome ?? null,
+      serverVersion: runtime?.serverVersion ?? null,
+      sessionLogPath: runtime?.sessionLogPath ?? null,
+    },
+  };
+}
+
+function parseProviderOptions(options: unknown): MuseProviderOptions {
+  const parsed = museProviderOptionsSchema.safeParse(options ?? {});
+  return parsed.success ? parsed.data : {};
+}
+
+type PermissionPolicy = {
+  permissionMode: string;
+  permissionScope?: string;
+  approvalReviewer?: string | null;
+};
+
+function approvalModeFor(policy: PermissionPolicy): string {
+  return museApprovalMode(policy);
+}
+
+function fullAccess(policy: PermissionPolicy): boolean {
+  return policy.permissionScope === "full" || policy.permissionMode === "full";
+}
+
+function postureFrom(
+  options: MuseProviderOptions,
+  policy: PermissionPolicy,
+): HostPosture {
+  return {
+    disableSandbox: options.sandbox !== "on" || fullAccess(policy),
+    sandboxNetwork: options.sandboxNetwork ?? "enabled",
+    trustWorkspace: options.trustWorkspace !== false,
+  };
+}
+
+function serveArgs(posture: HostPosture): string[] {
+  const args = ["serve"];
+  if (posture.disableSandbox) {
+    args.push("--disable-sandbox");
+  } else {
+    args.push("--sandbox-network", posture.sandboxNetwork);
+  }
+  if (posture.trustWorkspace) {
+    args.push("--trust-workspace");
+  }
+  return args;
+}
+
+export function buildConstruction(args: {
   cwd: string;
-  translator: MuseTranslator;
-  approvalMode: string;
-  modelId: string | null;
-  sessionLogPath: string | null;
-  injectedTools: Set<string>;
-  pendingInstructions: string | null;
-  needsReplacement: string | null;
-  pendingApprovals: Map<string, MspApprovalRequestParams>;
-  pendingUserInputs: Map<string, MspUserInputRequestParams>;
-  interruptWaiters: Set<() => void>;
+  options: BridgeExecutionOptions;
+  instructionMode: string;
+  dynamicTools: readonly DynamicTool[];
+}): SessionConstruction {
+  const providerOptions = parseProviderOptions(args.options.providerOptions);
+  return {
+    cwd: args.cwd,
+    posture: postureFrom(providerOptions, args.options),
+    approvalMode: approvalModeFor(args.options),
+    model: args.options.model,
+    toolNames: args.dynamicTools.map((tool) => tool.name),
+    instructionMode: args.instructionMode,
+  };
 }
 
-const hosts = new Map<string, MuseHost>();
-const sessions = new Map<string, MuseSession>();
-const sessionsByMuseId = new Map<string, MuseSession>();
+export function toolsSignature(tools: readonly DynamicTool[]): string {
+  return createHash("sha256")
+    .update(JSON.stringify(tools.map((tool) => tool.name).sort()))
+    .digest("hex")
+    .slice(0, 12);
+}
 
 let nextConfigHomeSerial = 0;
 
-/**
- * A fresh directory per host instance: an orphaned Muse process from a previous
- * bridge can never have its configuration pulled out from under it.
- */
 function configHomeSerial(): string {
   nextConfigHomeSerial += 1;
   return `${process.pid}-${nextConfigHomeSerial}`;
 }
 
-let bridgeDataDir: string | null = null;
-let toolProxy: ToolProxyEndpoint | null = null;
-let toolProxyScriptPath: string | null = null;
-
-/**
- * bb injects its own tools per thread, and Muse reads MCP servers from its
- * config rather than from a per-session parameter. A thread that carries
- * injected tools therefore gets a Muse host of its own, so one thread's tools
- * can never be offered to another's session.
- */
 async function ensureToolProxy(): Promise<ToolProxyEndpoint | null> {
   if (bridgeDataDir === null) {
     return null;
@@ -234,8 +342,8 @@ async function runInjectedTool(call: {
   callId: string;
   arguments: Record<string, unknown>;
 }) {
-  const session = sessions.get(call.threadId);
-  if (session === undefined) {
+  const attachment = attachments.get(call.threadId);
+  if (attachment === undefined || attachment.providerSessionId === null) {
     return {
       ok: false as const,
       error: `bb has no live session for thread ${call.threadId}`,
@@ -244,8 +352,8 @@ async function runInjectedTool(call: {
   const result = await sendRuntimeRequest(
     BRIDGE_INBOUND_REQUEST_METHODS.toolCall,
     {
-      providerThreadId: session.sessionId,
-      threadId: session.threadId,
+      providerThreadId: attachment.providerSessionId,
+      threadId: attachment.threadId,
       turnId: null,
       callId: call.callId,
       tool: call.tool,
@@ -262,84 +370,17 @@ async function runInjectedTool(call: {
 }
 
 /**
- * Muse's OS sandbox is all or nothing — `muse serve` offers `--disable-sandbox`
- * and nothing that grants a path — and it denies the Darwin per-user cache, so
- * under it no Swift or Clang compilation works at all: a two-line file fails on
- * `ModuleCache/…pcm: Operation not permitted`, Swift macros cannot start their
- * plugin server, and xcodebuild loses its XPC services. Codex's sandbox is tuned
- * for this (it grants TMPDIR and the workspace); Muse's cannot be.
- *
- * bb's permission modes and approval flow are the enforcement surface inside bb,
- * so the OS sandbox stays off unless the user asks for it, and full access turns
- * it off regardless.
+ * Muse reads its MCP configuration once, at host startup, and disables MCP for
+ * the whole runtime if that audit fails. A configuration directory therefore
+ * belongs to the child it was written for and is never touched again.
  */
-function postureFrom(
-  options: MuseProviderOptions,
-  policy: PermissionPolicy,
-): HostPosture {
-  return {
-    disableSandbox: options.sandbox !== "on" || fullAccess(policy),
-    sandboxNetwork: options.sandboxNetwork ?? "enabled",
-    trustWorkspace: options.trustWorkspace !== false,
-  };
-}
-
-function postureSignature(posture: HostPosture): string {
-  return [
-    posture.disableSandbox ? "nosandbox" : "sandbox",
-    posture.sandboxNetwork,
-    posture.trustWorkspace ? "trusted" : "untrusted",
-  ].join("|");
-}
-
-function serveArgs(posture: HostPosture): string[] {
-  const args = ["serve"];
-  if (posture.disableSandbox) {
-    args.push("--disable-sandbox");
-  } else {
-    args.push("--sandbox-network", posture.sandboxNetwork);
-  }
-  if (posture.trustWorkspace) {
-    args.push("--trust-workspace");
-  }
-  return args;
-}
-
-function parseProviderOptions(options: unknown): MuseProviderOptions {
-  const parsed = museProviderOptionsSchema.safeParse(options ?? {});
-  return parsed.success ? parsed.data : {};
-}
-
-function childEnv(
-  envVars: Record<string, string> | undefined,
-  configHome: string | null,
-): NodeJS.ProcessEnv {
-  const base = sanitizeInheritedChildProcessEnv({
-    env: withoutBridgeRuntimeEnv(process.env),
-  });
-  return {
-    ...base,
-    ...(envVars ?? {}),
-    ...(configHome === null ? {} : { XDG_CONFIG_HOME: configHome }),
-  };
-}
-
-/**
- * The private config directory this thread's Muse host reads: the user's own
- * settings and credentials, plus the one MCP server that reaches bb's tools.
- */
-/** Stable across bridge restarts, so an unchanged tool set reuses its host. */
-export function toolsSignature(tools: readonly DynamicTool[]): string {
-  return createHash("sha256")
-    .update(JSON.stringify(tools.map((tool) => tool.name).sort()))
-    .digest("hex")
-    .slice(0, 12);
-}
-
-async function buildThreadConfigHome(
+async function buildConfigHome(
   threadId: string,
   tools: readonly DynamicTool[],
 ): Promise<string | null> {
+  if (tools.length === 0) {
+    return null;
+  }
   const proxy = await ensureToolProxy();
   if (proxy === null || bridgeDataDir === null || toolProxyScriptPath === null) {
     return null;
@@ -355,11 +396,7 @@ async function buildThreadConfigHome(
       command: process.execPath,
       args: [toolProxyScriptPath],
       env: {
-        /**
-         * bb ships as an Electron app, so the bridge's own `execPath` is the
-         * Electron binary. Muse spawns the proxy directly, and without this the
-         * spawn opens a GUI process whose stdio transport closes at once.
-         */
+        /** bb ships as Electron, whose binary needs this to behave as node. */
         ELECTRON_RUN_AS_NODE: "1",
         BB_MUSE_TOOL_PORT: String(proxy.port),
         BB_MUSE_TOOL_TOKEN: proxy.token,
@@ -376,291 +413,365 @@ async function buildThreadConfigHome(
   });
 }
 
-async function ensureHost(args: {
+function childEnv(
+  envVars: Record<string, string> | undefined,
+  configHome: string | null,
+): NodeJS.ProcessEnv {
+  const base = sanitizeInheritedChildProcessEnv({
+    env: withoutBridgeRuntimeEnv(process.env),
+  });
+  return {
+    ...base,
+    ...(envVars ?? {}),
+    ...(configHome === null ? {} : { XDG_CONFIG_HOME: configHome }),
+  };
+}
+
+function spawnChild(args: {
   posture: HostPosture;
   cwd: string;
-  envVars?: Record<string, string>;
+  env: NodeJS.ProcessEnv;
   recordThreadId: string | null;
-  threadId?: string;
-  dynamicTools?: readonly DynamicTool[];
-}): Promise<MuseHost> {
-  const tools = args.dynamicTools ?? [];
-  const scopedToThread = tools.length > 0 && args.threadId !== undefined;
-  /**
-   * Muse reads its MCP configuration once, at host startup, and disables MCP
-   * for the whole runtime if that audit fails. The config directory therefore
-   * belongs to a host for as long as that host lives: it is keyed by the tools
-   * it was built for, and it is never rewritten under a running process. A
-   * thread whose injected tools change gets a new host rather than an edited
-   * directory.
-   */
-  const signature = scopedToThread
-    ? `${postureSignature(args.posture)}|thread:${args.threadId}|tools:${toolsSignature(tools)}`
-    : postureSignature(args.posture);
-
-  const existing = hosts.get(signature);
-  if (existing !== undefined && !existing.connection.exited) {
-    cancelIdleShutdown(existing);
-    await existing.ready;
-    return existing;
-  }
-
-  const configHome = scopedToThread
-    ? await buildThreadConfigHome(args.threadId as string, tools)
-    : null;
-
-  const host: MuseHost = {
-    signature,
-    connection: undefined as unknown as MspConnection,
-    ready: Promise.resolve(),
-    museHome: null,
-    serverVersion: null,
-    threadIds: new Set(),
-    idleTimer: null,
-  };
-
-  host.connection = createMspConnection({
+  onNotification(method: string, params: unknown): void;
+  onRequest(method: string, params: unknown): void;
+  onExit(info: MspExitInfo): void;
+}): MspConnection {
+  return createMspConnection({
     command: museExecutable(process.env),
     args: serveArgs(args.posture),
     cwd: args.cwd,
-    env: childEnv(args.envVars, configHome),
+    env: args.env,
     recordThreadId: args.recordThreadId,
-    onNotification: (method, params) => {
-      handleMuseNotification(host, method, params);
-    },
+    onNotification: args.onNotification,
     onRequest: (method, params, responder) => {
-      handleMuseRequest(host, method, params);
+      args.onRequest(method, params);
       responder.result({});
     },
-    onExit: (info) => {
-      handleHostExit(host, info);
+    onExit: args.onExit,
+  });
+}
+
+async function handshake(connection: MspConnection): Promise<{
+  museHome: string;
+  serverVersion: string;
+}> {
+  const result = await connection.request({
+    method: MSP_METHODS.initialize,
+    params: {
+      clientInfo: { name: CLIENT_NAME, title: "bb", version: CLIENT_VERSION },
+      capabilities: { requestedCapabilities: ["userShell"] },
     },
+    resultSchema: mspInitializeResultSchema,
+    timeoutMs: HANDSHAKE_TIMEOUT_MS,
+  });
+  connection.notify("initialized");
+  return { museHome: result.museHome, serverVersion: result.serverInfo.version };
+}
+
+type ConstructionRequest =
+  | { kind: "start" }
+  | { kind: "fresh" }
+  | { kind: "resume"; providerThreadId: string }
+  | { kind: "fork"; sourceProviderThreadId: string };
+
+/**
+ * Builds the live runtime for an attachment: one `muse serve` child per thread,
+ * as codex runs one app-server per session, so no thread can disturb another's
+ * configuration, sandbox posture, or session state.
+ */
+async function constructRuntime(args: {
+  attachment: MuseAttachment;
+  options: BridgeExecutionOptions;
+  request: ConstructionRequest;
+}): Promise<MuseRuntime> {
+  const { attachment } = args;
+  releaseRuntime(attachment, { kill: true });
+
+  const construction = attachment.construction;
+  const configHome = await buildConfigHome(
+    attachment.threadId,
+    attachment.dynamicTools,
+  );
+  attachment.configHome = configHome;
+
+  runtimeSerialCounter += 1;
+  const serial = runtimeSerialCounter;
+  const connection = spawnChild({
+    posture: construction.posture,
+    cwd: construction.cwd,
+    env: childEnv(args.options.envVars, configHome),
+    recordThreadId: attachment.threadId,
+    onNotification: (method, params) =>
+      handleChildNotification(attachment.threadId, serial, method, params),
+    onRequest: (method, params) =>
+      handleChildRequest(attachment.threadId, serial, method, params),
+    onExit: (info) => handleChildExit(attachment.threadId, serial, info),
   });
 
-  host.ready = host.connection
-    .request({
-      method: MSP_METHODS.initialize,
-      params: {
-        clientInfo: { name: CLIENT_NAME, title: "bb", version: CLIENT_VERSION },
-        capabilities: { requestedCapabilities: ["userShell"] },
-      },
-      resultSchema: mspInitializeResultSchema,
-      timeoutMs: HANDSHAKE_TIMEOUT_MS,
-    })
-    .then((result) => {
-      host.museHome = result.museHome;
-      host.serverVersion = result.serverInfo.version;
-      host.connection.notify("initialized");
-    });
+  const runtime = createRuntime({
+    serial,
+    connection,
+    cwd: construction.cwd,
+    approvalMode: construction.approvalMode,
+  });
+  attachment.runtime = runtime;
 
-  hosts.set(signature, host);
   try {
-    await host.ready;
+    const info = await handshake(connection);
+    runtime.museHome = info.museHome;
+    runtime.serverVersion = info.serverVersion;
+
+    const session = await openSession({
+      connection,
+      construction,
+      request: args.request,
+    });
+    runtime.sessionId = session.sessionId;
+    runtime.modelId = session.modelId;
+    runtime.approvalMode = session.approvalMode ?? construction.approvalMode;
+    runtime.sessionLogPath = session.path === "" ? null : session.path;
+
+    announceIdentity(attachment, session.sessionId);
+    emitDeltas(attachment, [
+      { kind: "session.reset" },
+      sessionStateDelta(attachment),
+    ]);
+    return runtime;
   } catch (error) {
-    hosts.delete(signature);
-    host.connection.kill();
+    runtime.closing = true;
+    if (attachment.runtime === runtime) {
+      attachment.runtime = null;
+    }
+    connection.kill();
     throw error;
   }
-  return host;
 }
 
-function handleHostExit(host: MuseHost, info: MspExitInfo): void {
-  hosts.delete(host.signature);
-  cancelIdleShutdown(host);
-  const message = `muse serve exited (code ${info.code ?? "null"}, signal ${
-    info.signal ?? "null"
-  })${info.stderrTail === "" ? "" : `: ${info.stderrTail}`}`;
-  for (const threadId of host.threadIds) {
-    const session = sessions.get(threadId);
-    if (session === undefined) {
-      continue;
-    }
-    emitDeltas(threadId, session.translator.settleOpenTurns("failed", message));
-    for (const waiter of session.interruptWaiters) {
-      waiter();
-    }
-    session.interruptWaiters.clear();
-    sessions.delete(threadId);
-    sessionsByMuseId.delete(session.sessionId);
-    notify(BRIDGE_NOTIFICATION_METHODS.providerRecovery, {
-      threadId,
-      kind: "restartRecommended",
-      message,
-      retryable: true,
+async function openSession(args: {
+  connection: MspConnection;
+  construction: SessionConstruction;
+  request: ConstructionRequest;
+}): Promise<{
+  sessionId: string;
+  modelId: string | null;
+  approvalMode: string | null;
+  path: string;
+}> {
+  const { connection, construction, request } = args;
+
+  if (request.kind === "start" || request.kind === "fresh") {
+    const result = await connection.request({
+      method: MSP_METHODS.sessionStart,
+      params: {
+        commandId: uuidV7(),
+        workspaceRoot: construction.cwd,
+        approvalMode: construction.approvalMode,
+        ...(construction.model === undefined
+          ? {}
+          : { modelId: construction.model }),
+      },
+      resultSchema: mspSessionStartResultSchema,
+      timeoutMs: COMMAND_TIMEOUT_MS,
     });
+    return {
+      sessionId: result.session.sessionId,
+      modelId: result.session.modelId,
+      approvalMode: result.session.approvalMode?.mode ?? null,
+      path: result.session.path,
+    };
   }
-  host.threadIds.clear();
+
+  const sourceId =
+    request.kind === "resume"
+      ? request.providerThreadId
+      : request.sourceProviderThreadId;
+  const result = await connection.request({
+    method:
+      request.kind === "resume"
+        ? MSP_METHODS.sessionResume
+        : MSP_METHODS.sessionFork,
+    params: { commandId: uuidV7(), sessionId: sourceId, excludeItems: true },
+    resultSchema: mspSessionResumeResultSchema,
+    timeoutMs: COMMAND_TIMEOUT_MS,
+  });
+  return {
+    sessionId: result.session.sessionId,
+    modelId: result.session.modelId,
+    approvalMode: result.session.approvalMode?.mode ?? null,
+    path: result.session.path,
+  };
 }
 
-function sessionFor(params: unknown): MuseSession | null {
+function releaseRuntime(
+  attachment: MuseAttachment,
+  options: { kill: boolean },
+): void {
+  const runtime = attachment.runtime;
+  if (runtime === null) {
+    return;
+  }
+  runtime.closing = true;
+  attachment.runtime = null;
+  if (options.kill) {
+    runtime.connection.kill();
+  }
+}
+
+function forgetAttachment(attachment: MuseAttachment): void {
+  attachment.closing = true;
+  cancelIdleShutdown(attachment);
+  releaseRuntime(attachment, { kill: true });
+  attachments.delete(attachment.threadId);
+  if (attachment.providerSessionId !== null) {
+    attachmentsBySessionId.delete(attachment.providerSessionId);
+  }
+}
+
+function cancelIdleShutdown(attachment: MuseAttachment): void {
+  if (attachment.idleTimer !== null) {
+    clearTimeout(attachment.idleTimer);
+    attachment.idleTimer = null;
+  }
+}
+
+function scheduleIdleShutdown(attachment: MuseAttachment): void {
+  cancelIdleShutdown(attachment);
+  attachment.idleTimer = setTimeout(() => {
+    attachment.idleTimer = null;
+    releaseRuntime(attachment, { kill: true });
+  }, ATTACHMENT_IDLE_SHUTDOWN_MS);
+  attachment.idleTimer.unref?.();
+}
+
+function attachmentForParams(params: unknown): MuseAttachment | null {
   if (typeof params !== "object" || params === null) {
     return null;
   }
   const sessionId = (params as { sessionId?: unknown }).sessionId;
   return typeof sessionId === "string"
-    ? (sessionsByMuseId.get(sessionId) ?? null)
+    ? (attachmentsBySessionId.get(sessionId) ?? null)
     : null;
 }
 
-function handleMuseNotification(
-  host: MuseHost,
+function handleChildNotification(
+  threadId: string,
+  serial: number,
   method: string,
   params: unknown,
 ): void {
-  const session = sessionFor(params);
-  if (session === null || session.host !== host) {
+  const runtime = liveRuntime(threadId, serial);
+  const attachment = attachments.get(threadId);
+  if (runtime === null || attachment === undefined) {
+    return;
+  }
+  if (attachmentForParams(params) !== attachment) {
     return;
   }
 
-  if (method === "approval/requested") {
-    openApprovalInteraction(session, params);
-    return;
-  }
-  if (method === "userInput/requested") {
-    openUserInputInteraction(session, params);
-    return;
-  }
-  if (method === "approval/resolved") {
-    const approvalId = (params as { approvalId?: unknown }).approvalId;
-    if (typeof approvalId === "string") {
-      session.pendingApprovals.delete(approvalId);
+  switch (method) {
+    case "approval/requested":
+      openApprovalInteraction(attachment, runtime, params);
+      return;
+    case "userInput/requested":
+      openUserInputInteraction(attachment, runtime, params);
+      return;
+    case "approval/resolved": {
+      const approvalId = (params as { approvalId?: unknown }).approvalId;
+      if (typeof approvalId === "string") {
+        runtime.pendingApprovals.delete(approvalId);
+      }
+      return;
     }
-    return;
-  }
-  if (method === "userInput/settled") {
-    const userInputId = (params as { userInputId?: unknown }).userInputId;
-    if (typeof userInputId === "string") {
-      session.pendingUserInputs.delete(userInputId);
+    case "userInput/settled": {
+      const userInputId = (params as { userInputId?: unknown }).userInputId;
+      if (typeof userInputId === "string") {
+        runtime.pendingUserInputs.delete(userInputId);
+      }
+      return;
     }
-    return;
-  }
-  if (method === "session/approvalModeChanged") {
-    /**
-     * Track the mode Muse reports rather than the one bb asked for: a belief
-     * that drifts from the host is how a full-access thread ends up prompting
-     * for every command.
-     */
-    const mode = (params as { mode?: unknown }).mode;
-    if (typeof mode === "string") {
-      session.approvalMode = mode;
-      emitDeltas(session.threadId, [sessionStateDelta(session)]);
+    case "session/approvalModeChanged": {
+      const mode = (params as { mode?: unknown }).mode;
+      if (typeof mode === "string") {
+        runtime.approvalMode = mode;
+        emitDeltas(attachment, [sessionStateDelta(attachment)]);
+      }
+      return;
     }
-    return;
-  }
-  if (method === "session/modelChanged") {
-    const modelId = (params as { modelId?: unknown }).modelId;
-    if (typeof modelId === "string") {
-      session.modelId = modelId;
-      emitDeltas(session.threadId, [sessionStateDelta(session)]);
+    case "session/modelChanged": {
+      const modelId = (params as { modelId?: unknown }).modelId;
+      if (typeof modelId === "string") {
+        runtime.modelId = modelId;
+        emitDeltas(attachment, [sessionStateDelta(attachment)]);
+      }
+      return;
     }
-    return;
+    default:
+      break;
   }
-
-  if (method === "turn/completed") {
-    const failure = replaceableTurnFailure(params);
-    if (failure !== null) {
-      session.needsReplacement = failure;
-    }
-  }
-
-  const deltas = session.translator.onNotification(method, params);
-  emitDeltas(session.threadId, deltas);
 
   if (method === "turn/completed") {
-    for (const waiter of session.interruptWaiters) {
-      waiter();
+    const classified = classifyTurnFailure(params);
+    if (classified.restart !== null) {
+      attachment.restartBeforeNextTurn = classified.restart;
     }
-    session.interruptWaiters.clear();
+    if (classified.hint !== null) {
+      notify(BRIDGE_NOTIFICATION_METHODS.providerRecovery, {
+        threadId: attachment.threadId,
+        ...classified.hint,
+      });
+    }
   }
+
+  emitDeltas(attachment, runtime.translator.onNotification(method, params));
 }
 
-/**
- * MSP re-issues an unsettled approval or prompt as a server-to-client request
- * after a resume. The authoritative answer always travels back on the command
- * plane, so the request itself only needs an ack.
- */
-function handleMuseRequest(
-  host: MuseHost,
+function handleChildRequest(
+  threadId: string,
+  serial: number,
   method: string,
   params: unknown,
 ): void {
-  const session = sessionFor(params);
-  if (session === null || session.host !== host) {
+  const runtime = liveRuntime(threadId, serial);
+  const attachment = attachments.get(threadId);
+  if (runtime === null || attachment === undefined) {
     return;
   }
   if (method === "approval/request") {
-    openApprovalInteraction(session, params);
+    openApprovalInteraction(attachment, runtime, params);
     return;
   }
   if (method === "userInput/request") {
-    openUserInputInteraction(session, params);
+    openUserInputInteraction(attachment, runtime, params);
   }
 }
 
-/**
- * A Muse session cannot replay its own encrypted reasoning once its route
- * changes, and a route belongs to a `muse serve` process: resume the session on
- * a second process and the next model call after a tool result fails with
- * `provider-private history is incompatible with the active route`. The failure
- * is durable — the offending reasoning item stays in the session — so the
- * session never recovers, and compaction does not clear it.
- *
- * MSP gives this no error kind of its own; it arrives as a turn terminal whose
- * free text names the condition. Matching that text is the only signal there is,
- * so it is matched narrowly and used only to decide that the session must be
- * replaced — never to synthesise a result.
- */
-export function replaceableTurnFailure(params: unknown): string | null {
-  const parsed = mspTurnCompletedParamsSchema.safeParse(params);
-  if (!parsed.success || parsed.data.terminal !== "failed") {
-    return null;
+function handleChildExit(
+  threadId: string,
+  serial: number,
+  info: MspExitInfo,
+): void {
+  const runtime = liveRuntime(threadId, serial);
+  const attachment = attachments.get(threadId);
+  if (runtime === null || attachment === undefined) {
+    return;
   }
-  const message = parsed.data.error?.message ?? parsed.data.reason ?? "";
-  const incompatibleHistory =
-    message.includes("provider-private history is incompatible") ||
-    (message.includes("reasoning replay") &&
-      message.includes("provider attribution"));
-  return incompatibleHistory
-    ? "Muse could not replay this session's reasoning history after its route changed"
-    : null;
-}
+  const message = `muse serve exited (code ${info.code ?? "null"}, signal ${
+    info.signal ?? "null"
+  })${info.stderrTail === "" ? "" : `: ${info.stderrTail}`}`;
 
-function sessionStateDelta(session: MuseSession): ThreadDelta {
-  return {
-    kind: "extension.state",
-    extensionKind: MUSE_SESSION_EXTENSION_KIND,
-    payload: {
-      approvalMode: session.approvalMode,
-      modelId: session.modelId,
-      museHome: session.host.museHome,
-      serverVersion: session.host.serverVersion,
-      sessionLogPath: session.sessionLogPath,
-    },
+  emitDeltas(attachment, runtime.translator.settleOpenTurns("failed", message));
+  releaseRuntime(attachment, { kill: false });
+  attachment.restartBeforeNextTurn = {
+    reason: "Muse exited; bb restored the session on a fresh process",
+    fresh: false,
   };
-}
-
-/**
- * bb's own plumbing must not read as a decision for the user. Two approvals are
- * the bridge asking permission to be itself: Muse's sandbox gating the loopback
- * connection to the tool proxy this bridge started, and Muse gating a tool bb
- * injected — which bb already governs on its own side, before it ever reaches
- * the runtime. Both are approved here rather than shown.
- */
-function isBridgeInfrastructureApproval(
-  session: MuseSession,
-  request: MspApprovalRequestParams,
-): boolean {
-  const subject = request.subject;
-  if (
-    subject.kind === "network" &&
-    (subject.host === "127.0.0.1" || subject.host === "localhost") &&
-    toolProxy !== null &&
-    subject.port === toolProxy.port
-  ) {
-    return true;
-  }
-  const tool = subject.toolName ?? request.toolName;
-  return session.injectedTools.has(stripMcpPrefix(tool));
+  notify(BRIDGE_NOTIFICATION_METHODS.error, {
+    threadId: attachment.threadId,
+    ...(attachment.providerSessionId === null
+      ? {}
+      : { providerThreadId: attachment.providerSessionId }),
+    message,
+  });
 }
 
 /**
@@ -676,43 +787,69 @@ export function stripMcpPrefix(tool: string): string {
   return dotted?.groups?.name ?? tool;
 }
 
-function openApprovalInteraction(session: MuseSession, params: unknown): void {
+/**
+ * bb's own plumbing must not read as a decision for the user: Muse's sandbox
+ * gating the loopback connection to the tool proxy this bridge started, and
+ * Muse gating a tool bb injected, which bb already governs on its own side.
+ */
+function isBridgeInfrastructureApproval(
+  attachment: MuseAttachment,
+  request: MspApprovalRequestParams,
+): boolean {
+  const subject = request.subject;
+  if (
+    subject.kind === "network" &&
+    (subject.host === "127.0.0.1" || subject.host === "localhost") &&
+    toolProxy !== null &&
+    subject.port === toolProxy.port
+  ) {
+    return true;
+  }
+  const tool = subject.toolName ?? request.toolName;
+  return attachment.construction.toolNames.includes(stripMcpPrefix(tool));
+}
+
+function openApprovalInteraction(
+  attachment: MuseAttachment,
+  runtime: MuseRuntime,
+  params: unknown,
+): void {
   const parsed = mspApprovalRequestParamsSchema.safeParse(params);
   if (!parsed.success) {
     return;
   }
   const request = parsed.data;
-  if (session.pendingApprovals.has(request.approvalId)) {
+  if (runtime.pendingApprovals.has(request.approvalId)) {
     return;
   }
-  if (isBridgeInfrastructureApproval(session, request)) {
-    void decideApproval(session, request, { decision: "allow_for_session" });
+  if (isBridgeInfrastructureApproval(attachment, request)) {
+    void decideApproval(runtime, request, { decision: "allow_for_session" });
     return;
   }
   const payload = approvalPayloadFromMsp(request);
   if (payload === null) {
     return;
   }
-  session.pendingApprovals.set(request.approvalId, request);
+  runtime.pendingApprovals.set(request.approvalId, request);
 
   void sendRuntimeRequest(BRIDGE_INBOUND_REQUEST_METHODS.interactionRequest, {
-    providerThreadId: session.sessionId,
-    threadId: session.threadId,
+    providerThreadId: runtime.sessionId ?? attachment.threadId,
+    threadId: attachment.threadId,
     turnId: request.turnId,
     payload,
     providerNativeIds: true,
   })
     .then((resolution) => {
-      session.pendingApprovals.delete(request.approvalId);
-      return decideApproval(session, request, resolution);
+      runtime.pendingApprovals.delete(request.approvalId);
+      return decideApproval(runtime, request, resolution);
     })
     .catch(() => {
-      session.pendingApprovals.delete(request.approvalId);
+      runtime.pendingApprovals.delete(request.approvalId);
     });
 }
 
 async function decideApproval(
-  session: MuseSession,
+  runtime: MuseRuntime,
   request: MspApprovalRequestParams,
   resolution: unknown,
 ): Promise<void> {
@@ -728,15 +865,15 @@ async function decideApproval(
       ? decision
       : "deny",
   );
-  if (choiceId === null) {
+  if (choiceId === null || runtime.closing) {
     return;
   }
   try {
-    await session.host.connection.request({
+    await runtime.connection.request({
       method: MSP_METHODS.approvalDecide,
       params: {
         commandId: uuidV7(),
-        sessionId: session.sessionId,
+        sessionId: runtime.sessionId,
         approvalId: request.approvalId,
         requirementId: request.currentRequirementId,
         choiceId,
@@ -745,58 +882,57 @@ async function decideApproval(
       timeoutMs: COMMAND_TIMEOUT_MS,
     });
   } catch (error) {
-    /**
-     * A decision that lost a race is already settled by whoever won it; every
-     * other failure is reported on the timeline by the turn itself.
-     */
     if (
-      !(error instanceof MspRequestError) ||
-      error.kind !== "approvalAlreadyResolved"
+      error instanceof MspRequestError &&
+      error.kind === "approvalAlreadyResolved"
     ) {
-      emitDeltas(session.threadId, [
-        {
-          kind: "provider.warning",
-          summary: "Muse rejected an approval decision",
-          details: error instanceof Error ? error.message : String(error),
-        },
-      ]);
+      return;
     }
+    process.stderr.write(
+      `muse bridge: approval decision failed: ${
+        error instanceof Error ? error.message : String(error)
+      }\n`,
+    );
   }
 }
 
-function openUserInputInteraction(session: MuseSession, params: unknown): void {
+function openUserInputInteraction(
+  attachment: MuseAttachment,
+  runtime: MuseRuntime,
+  params: unknown,
+): void {
   const parsed = mspUserInputRequestParamsSchema.safeParse(params);
   if (!parsed.success) {
     return;
   }
   const request = parsed.data;
-  if (session.pendingUserInputs.has(request.userInputId)) {
+  if (runtime.pendingUserInputs.has(request.userInputId)) {
     return;
   }
   const payload = userQuestionPayloadFromMsp(request);
   if (payload === null) {
     return;
   }
-  session.pendingUserInputs.set(request.userInputId, request);
+  runtime.pendingUserInputs.set(request.userInputId, request);
 
   void sendRuntimeRequest(BRIDGE_INBOUND_REQUEST_METHODS.interactionRequest, {
-    providerThreadId: session.sessionId,
-    threadId: session.threadId,
+    providerThreadId: runtime.sessionId ?? attachment.threadId,
+    threadId: attachment.threadId,
     turnId: request.turnId,
     payload,
     providerNativeIds: true,
   })
     .then((resolution) => {
-      session.pendingUserInputs.delete(request.userInputId);
-      return settleUserInput(session, request, resolution);
+      runtime.pendingUserInputs.delete(request.userInputId);
+      return settleUserInput(runtime, request, resolution);
     })
     .catch(() => {
-      session.pendingUserInputs.delete(request.userInputId);
+      runtime.pendingUserInputs.delete(request.userInputId);
     });
 }
 
 async function settleUserInput(
-  session: MuseSession,
+  runtime: MuseRuntime,
   request: MspUserInputRequestParams,
   resolution: unknown,
 ): Promise<void> {
@@ -804,12 +940,15 @@ async function settleUserInput(
     request,
     resolution as PendingInteractionResolution,
   );
+  if (runtime.closing) {
+    return;
+  }
   try {
-    await session.host.connection.request({
+    await runtime.connection.request({
       method: settlement.method,
       params: {
         commandId: uuidV7(),
-        sessionId: session.sessionId,
+        sessionId: runtime.sessionId,
         userInputId: request.userInputId,
         ...(settlement.answers === undefined
           ? {}
@@ -825,6 +964,39 @@ async function settleUserInput(
   } catch {
     /** A settled prompt needs no second answer; the turn reports the outcome. */
   }
+}
+
+/**
+ * bb states how an agent should behave inside it as session instructions. MSP
+ * has no system-prompt slot, so they ride the first turn the way the Claude
+ * bridge delivers them, with `displayText` carrying the user's own prompt so the
+ * transcript shows what they wrote.
+ */
+export function withInstructions(
+  parts: readonly { type: "text" | "image"; [key: string]: unknown }[],
+  instructions: string | null,
+): { type: "text" | "image"; [key: string]: unknown }[] {
+  if (instructions === null || instructions.trim() === "") {
+    return [...parts];
+  }
+  return [
+    {
+      type: "text",
+      text: `<system_instructions>\n${instructions.trim()}\n</system_instructions>`,
+    },
+    ...parts,
+  ];
+}
+
+function promptDisplayText(input: readonly PromptInput[]): string | undefined {
+  const text = input
+    .filter((item): item is Extract<PromptInput, { type: "text" }> =>
+      item.type === "text",
+    )
+    .map((item) => item.text)
+    .join("")
+    .trim();
+  return text === "" ? undefined : text;
 }
 
 async function turnInputParts(
@@ -869,128 +1041,220 @@ function reasoningEffortFor(level: string | undefined): string | undefined {
   return MUSE_REASONING_EFFORTS[level as keyof typeof MUSE_REASONING_EFFORTS];
 }
 
-type PermissionPolicy = {
-  permissionMode: string;
-  permissionScope?: string;
-  approvalReviewer?: string | null;
-};
+/**
+ * The one place a turn may run from. A rebuild is owed when the child is gone,
+ * when a failure asked for one, or when the execution options changed in a way
+ * Muse only reads at session construction — the same three reasons codex
+ * rebuilds, plus Muse's inability to carry reasoning across a route change.
+ */
+async function liveRuntimeForTurn(args: {
+  attachment: MuseAttachment;
+  options: BridgeExecutionOptions;
+}): Promise<MuseRuntime> {
+  const { attachment } = args;
+  cancelIdleShutdown(attachment);
 
-function approvalModeFor(policy: PermissionPolicy): string {
-  return museApprovalMode(policy);
-}
-
-/** Full access means Muse's own sandbox stands down too, the way it does for
- * every other provider bb ships. */
-function fullAccess(policy: PermissionPolicy): boolean {
-  return policy.permissionScope === "full" || policy.permissionMode === "full";
-}
-
-async function reconcileSessionOptions(
-  session: MuseSession,
-  options: { model?: string } & PermissionPolicy,
-): Promise<void> {
-  const approvalMode = approvalModeFor(options);
-  if (approvalMode !== session.approvalMode) {
-    await session.host.connection.request({
-      method: MSP_METHODS.sessionSetApprovalMode,
-      params: {
-        commandId: uuidV7(),
-        sessionId: session.sessionId,
-        mode: approvalMode,
-      },
-      resultSchema: mspEmptyResultSchema,
-      timeoutMs: COMMAND_TIMEOUT_MS,
-    });
-    session.approvalMode = approvalMode;
-  }
-  if (options.model !== undefined && options.model !== session.modelId) {
-    await session.host.connection.request({
-      method: MSP_METHODS.sessionSetModel,
-      params: {
-        commandId: uuidV7(),
-        sessionId: session.sessionId,
-        model: { modelId: options.model },
-      },
-      resultSchema: mspCommandAckSchema,
-      timeoutMs: COMMAND_TIMEOUT_MS,
-    });
-    session.modelId = options.model;
-  }
-}
-
-function registerSession(args: {
-  threadId: string;
-  sessionId: string;
-  host: MuseHost;
-  cwd: string;
-  approvalMode: string;
-  modelId: string | null;
-  sessionLogPath: string | null;
-  injectedTools?: readonly string[];
-  instructions?: string;
-}): MuseSession {
-  const previous = sessions.get(args.threadId);
-  if (previous !== undefined) {
-    sessionsByMuseId.delete(previous.sessionId);
-    previous.host.threadIds.delete(args.threadId);
-  }
-  const session: MuseSession = {
-    threadId: args.threadId,
-    sessionId: args.sessionId,
-    host: args.host,
-    cwd: args.cwd,
-    translator: new MuseTranslator({ cwd: args.cwd }),
-    approvalMode: args.approvalMode,
-    modelId: args.modelId,
-    sessionLogPath: args.sessionLogPath,
-    injectedTools: new Set(args.injectedTools ?? []),
-    pendingInstructions:
-      args.instructions !== undefined && args.instructions.trim() !== ""
-        ? args.instructions
-        : null,
-    needsReplacement: null,
-    pendingApprovals: new Map(),
-    pendingUserInputs: new Map(),
-    interruptWaiters: new Set(),
-  };
-  sessions.set(args.threadId, session);
-  sessionsByMuseId.set(args.sessionId, session);
-  args.host.threadIds.add(args.threadId);
-  cancelIdleShutdown(args.host);
-
-  notify(BRIDGE_NOTIFICATION_METHODS.threadIdentity, {
-    threadId: args.threadId,
-    providerThreadId: args.sessionId,
+  const nextConstruction = buildConstruction({
+    cwd: attachment.cwd,
+    options: args.options,
+    instructionMode: attachment.construction.instructionMode,
+    dynamicTools: attachment.dynamicTools,
   });
-  emitDeltas(args.threadId, [
-    { kind: "session.reset" },
-    sessionStateDelta(session),
-  ]);
-  return session;
+  const nextSignature = constructionSignature(nextConstruction);
+
+  const runtime = attachment.runtime;
+  const restart = attachment.restartBeforeNextTurn;
+  const optionsChanged = nextSignature !== attachment.constructionSignature;
+
+  if (
+    runtime !== null &&
+    !runtime.closing &&
+    !runtime.connection.exited &&
+    restart === null &&
+    !optionsChanged
+  ) {
+    return runtime;
+  }
+
+  if (runtime !== null && !runtime.closing) {
+    emitDeltas(
+      attachment,
+      runtime.translator.settleOpenTurns(
+        "interrupted",
+        "The Muse session was replaced",
+      ),
+    );
+  }
+
+  attachment.restartBeforeNextTurn = null;
+  attachment.construction = nextConstruction;
+  attachment.constructionSignature = nextSignature;
+
+  const fresh = restart?.fresh === true;
+  const resumeId = attachment.providerSessionId;
+  const request: ConstructionRequest =
+    fresh || resumeId === null
+      ? { kind: "fresh" }
+      : { kind: "resume", providerThreadId: resumeId };
+
+  const reason =
+    restart?.reason ??
+    (optionsChanged
+      ? "Execution settings changed; the Muse session was rebuilt to apply them"
+      : "Muse exited; bb restored the session on a fresh process");
+
+  const replacement = await constructRuntime({
+    attachment,
+    options: args.options,
+    request,
+  });
+  notify(BRIDGE_NOTIFICATION_METHODS.sessionReplaced, {
+    threadId: attachment.threadId,
+    providerThreadId: replacement.sessionId,
+    reason,
+    contextLost: fresh,
+  });
+  if (fresh) {
+    emitDeltas(attachment, [
+      {
+        kind: "provider.warning",
+        summary: "Muse started a fresh session for this thread",
+        details: `${reason}. Durable bb state is untouched; the in-session conversation is not.`,
+      },
+    ]);
+  }
+  return replacement;
 }
 
-async function authRecoveryIfUnauthenticated(): Promise<void> {
-  const credentials = await readMuseCredentials();
-  if (credentials === null || credentials.expired) {
-    throw new BridgeRecoveryError({
-      code: BRIDGE_JSON_RPC_ERRORS.BRIDGE_ERROR,
-      message:
-        credentials === null
-          ? "Muse Code is not signed in. Run `muse login` on this machine."
-          : "The Muse Code session expired. Run `muse login` on this machine.",
-      recovery: {
-        kind: "authRequired",
-        message: "Muse Code needs a sign-in before it can start a session.",
-        retryable: false,
+let zeroWorkCounter = 0;
+
+/**
+ * A prompt the provider handles without doing work must still settle, or the
+ * thread hangs on accepted input that never opens a turn.
+ */
+function scheduleZeroWorkSettlement(args: {
+  attachment: MuseAttachment;
+  runtime: MuseRuntime;
+  clientRequestId: string;
+}): void {
+  const { attachment, runtime, clientRequestId } = args;
+  const timer = setTimeout(() => {
+    const live = liveRuntime(attachment.threadId, runtime.serial);
+    if (live === null || live.openTurnIds.size > 0) {
+      return;
+    }
+    zeroWorkCounter += 1;
+    const providerTurnId = `zero-work-${zeroWorkCounter}`;
+    emitDeltas(attachment, [
+      { kind: "turn.open", providerTurnId },
+      { kind: "input.accepted", clientRequestId, providerTurnId },
+      { kind: "turn.boundary", providerTurnId, status: "completed" },
+    ]);
+  }, ZERO_WORK_SETTLEMENT_GRACE_MS);
+  timer.unref?.();
+}
+
+async function submitTurn(args: {
+  attachment: MuseAttachment;
+  input: readonly PromptInput[];
+  options: BridgeExecutionOptions;
+  clientRequestId?: string;
+}): Promise<void> {
+  const { attachment, options } = args;
+  let acceptedEmitted = false;
+
+  try {
+    const runtime = await liveRuntimeForTurn({ attachment, options });
+
+    if (args.clientRequestId !== undefined) {
+      emitDeltas(attachment, [
+        { kind: "input.accepted", clientRequestId: args.clientRequestId },
+      ]);
+      acceptedEmitted = true;
+    }
+
+    if (isStandaloneBuiltinCompactCommand(args.input)) {
+      await runtime.connection.request({
+        method: MSP_METHODS.sessionCompact,
+        params: { commandId: uuidV7(), sessionId: runtime.sessionId },
+        resultSchema: mspCommandAckSchema,
+        timeoutMs: COMMAND_TIMEOUT_MS,
+      });
+      emitDeltas(attachment, [
+        { kind: "turn.open" },
+        { kind: "turn.boundary", status: "completed" },
+      ]);
+      return;
+    }
+
+    const instructions = attachment.pendingInstructions;
+    const input = withInstructions(
+      await turnInputParts(args.input),
+      instructions,
+    );
+    const displayText =
+      instructions === null ? undefined : promptDisplayText(args.input);
+    const reasoningEffort = reasoningEffortFor(options.reasoningLevel);
+
+    await runtime.connection.request({
+      method: MSP_METHODS.turnStart,
+      params: {
+        commandId: uuidV7(),
+        sessionId: runtime.sessionId,
+        input,
+        ifBusy: "queue",
+        ...(displayText === undefined ? {} : { displayText }),
+        ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
       },
+      resultSchema: mspTurnStartResultSchema,
+      timeoutMs: COMMAND_TIMEOUT_MS,
     });
+    attachment.pendingInstructions = null;
+    if (args.clientRequestId !== undefined) {
+      scheduleZeroWorkSettlement({
+        attachment,
+        runtime,
+        clientRequestId: args.clientRequestId,
+      });
+    }
+  } catch (error) {
+    /**
+     * Accepted input that never settles leaves bb refusing every later turn on
+     * the thread, so every failure on this path closes the turn — including one
+     * thrown before the input was ever accepted.
+     */
+    const message = error instanceof Error ? error.message : String(error);
+    const deltas: ThreadDelta[] = [];
+    if (!acceptedEmitted && args.clientRequestId !== undefined) {
+      deltas.push({
+        kind: "input.accepted",
+        clientRequestId: args.clientRequestId,
+      });
+    }
+    deltas.push(
+      { kind: "provider.error", message, settlesTurn: true },
+      {
+        kind: "turn.boundary",
+        status: "failed",
+        claimIfIdle: true,
+        error: { message },
+      },
+    );
+    emitDeltas(attachment, deltas);
+    if (error instanceof MspExitedError) {
+      notify(BRIDGE_NOTIFICATION_METHODS.providerRecovery, {
+        threadId: attachment.threadId,
+        kind: "restartRecommended",
+        message,
+        retryable: true,
+      });
+    }
   }
 }
 
 /**
- * Muse's catalog labels a model with its own id. BB strips the declared brand
- * prefix from what it shows, so an id becomes a title here and reads as
- * "Spark 1.3 Contributor" in the picker.
+ * Muse's catalog labels a model with its own id. bb strips the declared brand
+ * prefix from what it shows, so an id becomes a title here.
  */
 export function museModelDisplayName(entry: {
   modelId: string;
@@ -1031,13 +1295,58 @@ function modelFromCatalog(entry: MspModelCatalogEntry): AvailableModel {
   };
 }
 
+/**
+ * Model listing runs on a child of its own, as codex keeps a separate
+ * app-server for it: a catalog read must never disturb, or be disturbed by, a
+ * thread's session.
+ */
+async function maintenanceChild(cwd: string): Promise<MspConnection> {
+  if (maintenanceConnection !== null && !maintenanceConnection.exited) {
+    return maintenanceConnection;
+  }
+  if (maintenanceConnectionPromise !== null) {
+    return maintenanceConnectionPromise;
+  }
+  const promise = (async () => {
+    const connection = spawnChild({
+      posture: {
+        disableSandbox: true,
+        sandboxNetwork: "enabled",
+        trustWorkspace: false,
+      },
+      cwd,
+      env: childEnv(undefined, null),
+      recordThreadId: null,
+      onNotification: () => {},
+      onRequest: () => {},
+      onExit: () => {
+        if (maintenanceConnection === connection) {
+          maintenanceConnection = null;
+        }
+      },
+    });
+    try {
+      await handshake(connection);
+      maintenanceConnection = connection;
+      return connection;
+    } catch (error) {
+      connection.kill();
+      throw error;
+    }
+  })();
+  maintenanceConnectionPromise = promise;
+  try {
+    return await promise;
+  } finally {
+    if (maintenanceConnectionPromise === promise) {
+      maintenanceConnectionPromise = null;
+    }
+  }
+}
+
 async function listModels(cwd: string): Promise<AvailableModel[]> {
-  const host = await ensureHost({
-    posture: postureFrom({}, { permissionMode: "auto" }),
-    cwd,
-    recordThreadId: null,
-  });
-  const result = await host.connection.request({
+  const connection = await maintenanceChild(cwd);
+  const result = await connection.request({
     method: MSP_METHODS.modelList,
     resultSchema: mspModelListResultSchema,
     timeoutMs: COMMAND_TIMEOUT_MS,
@@ -1067,14 +1376,55 @@ function invalidParams(id: JsonRpcId, method: string, issues: unknown): void {
   });
 }
 
-function requireSession(threadId: string): MuseSession {
-  const session = sessions.get(threadId);
-  if (session === undefined) {
-    throw new Error(
-      `No Muse session for thread ${threadId}; send thread/start or thread/resume first`,
-    );
+function registerAttachment(args: {
+  threadId: string;
+  cwd: string;
+  options: BridgeExecutionOptions;
+  instructionMode: string;
+  dynamicTools: readonly DynamicTool[];
+}): MuseAttachment {
+  const existing = attachments.get(args.threadId);
+  if (existing !== undefined) {
+    forgetAttachment(existing);
   }
-  return session;
+  const construction = buildConstruction({
+    cwd: args.cwd,
+    options: args.options,
+    instructionMode: args.instructionMode,
+    dynamicTools: args.dynamicTools,
+  });
+  const instructions =
+    args.options.instructions !== undefined &&
+    args.options.instructions.trim() !== ""
+      ? args.options.instructions
+      : null;
+  const attachment: MuseAttachment = {
+    threadId: args.threadId,
+    cwd: args.cwd,
+    construction,
+    constructionSignature: constructionSignature(construction),
+    dynamicTools: [...args.dynamicTools],
+    instructions,
+    pendingInstructions: instructions,
+    providerSessionId: null,
+    configHome: null,
+    runtime: null,
+    identityAnnounced: false,
+    pendingPreIdentityDeltas: [],
+    restartBeforeNextTurn: null,
+    idleTimer: null,
+    closing: false,
+  };
+  attachments.set(args.threadId, attachment);
+  return attachment;
+}
+
+function constructionError(id: JsonRpcId, error: unknown): void {
+  io.sendError(
+    id,
+    BRIDGE_JSON_RPC_ERRORS.BRIDGE_ERROR,
+    error instanceof Error ? error.message : String(error),
+  );
 }
 
 type RequestHandler = (id: JsonRpcId, params: unknown) => Promise<void> | void;
@@ -1108,7 +1458,6 @@ const handlers: Record<string, RequestHandler> = {
       invalidParams(id, BRIDGE_REQUEST_METHODS.modelList, parsed.error.issues);
       return;
     }
-    await authRecoveryIfUnauthenticated();
     io.sendResult(id, {
       models: await listModels(parsed.data.cwd ?? process.cwd()),
       selectedOnlyModels: [],
@@ -1181,47 +1530,30 @@ const handlers: Record<string, RequestHandler> = {
       return;
     }
     const { threadId, cwd, options, input } = parsed.data;
-    await authRecoveryIfUnauthenticated();
-    const providerOptions = parseProviderOptions(options.providerOptions);
-    const host = await ensureHost({
-      posture: postureFrom(providerOptions, options),
-      cwd,
-      envVars: options.envVars,
-      recordThreadId: threadId,
+    const attachment = registerAttachment({
       threadId,
-      dynamicTools: parsed.data.dynamicTools,
-    });
-    const approvalMode = approvalModeFor(options);
-    const result = await host.connection.request({
-      method: MSP_METHODS.sessionStart,
-      params: {
-        commandId: uuidV7(),
-        workspaceRoot: cwd,
-        approvalMode,
-        ...(options.model === undefined ? {} : { modelId: options.model }),
-      },
-      resultSchema: mspSessionStartResultSchema,
-      timeoutMs: COMMAND_TIMEOUT_MS,
-    });
-    const session = registerSession({
-      threadId,
-      sessionId: result.session.sessionId,
-      host,
       cwd,
-      approvalMode,
-      modelId: result.session.modelId,
-      sessionLogPath: result.session.path === "" ? null : result.session.path,
-      injectedTools: (parsed.data.dynamicTools ?? []).map((tool) => tool.name),
-      ...(options.instructions === undefined
-        ? {}
-        : { instructions: options.instructions }),
+      options,
+      instructionMode: parsed.data.instructionMode,
+      dynamicTools: parsed.data.dynamicTools ?? [],
     });
-    io.sendResult(id, {
-      providerThreadId: session.sessionId,
-      sessionRestorable: result.session.path !== "",
-    });
+    try {
+      const runtime = await constructRuntime({
+        attachment,
+        options,
+        request: { kind: "start" },
+      });
+      io.sendResult(id, {
+        providerThreadId: runtime.sessionId,
+        sessionRestorable: runtime.sessionLogPath !== null,
+      });
+    } catch (error) {
+      forgetAttachment(attachment);
+      constructionError(id, error);
+      return;
+    }
     if (input !== undefined && input.length > 0) {
-      await submitTurn({ session, input, options });
+      await submitTurn({ attachment, input, options });
     }
   },
 
@@ -1236,29 +1568,44 @@ const handlers: Record<string, RequestHandler> = {
       return;
     }
     const { threadId, cwd, options, providerThreadId } = parsed.data;
-    await authRecoveryIfUnauthenticated();
-    const providerOptions = parseProviderOptions(options.providerOptions);
-    const host = await ensureHost({
-      posture: postureFrom(providerOptions, options),
-      cwd,
-      envVars: options.envVars,
-      recordThreadId: threadId,
+    const existing = attachments.get(threadId);
+    if (
+      existing !== undefined &&
+      existing.providerSessionId === providerThreadId &&
+      existing.runtime !== null &&
+      !existing.runtime.closing &&
+      !existing.runtime.connection.exited
+    ) {
+      /**
+       * This thread's own child is still live with the session loaded. Reusing
+       * it keeps the route, and therefore the session's reasoning history,
+       * which a resume onto a fresh process would invalidate.
+       */
+      cancelIdleShutdown(existing);
+      io.sendResult(id, { providerThreadId, sessionRestorable: true });
+      return;
+    }
+
+    const attachment = registerAttachment({
       threadId,
-      dynamicTools: parsed.data.dynamicTools,
+      cwd,
+      options,
+      instructionMode: parsed.data.instructionMode,
+      dynamicTools: parsed.data.dynamicTools ?? [],
     });
-    let result;
+    attachment.providerSessionId = providerThreadId;
     try {
-      result = await host.connection.request({
-        method: MSP_METHODS.sessionResume,
-        params: {
-          commandId: uuidV7(),
-          sessionId: providerThreadId,
-          excludeItems: true,
-        },
-        resultSchema: mspSessionResumeResultSchema,
-        timeoutMs: COMMAND_TIMEOUT_MS,
+      const runtime = await constructRuntime({
+        attachment,
+        options,
+        request: { kind: "resume", providerThreadId },
+      });
+      io.sendResult(id, {
+        providerThreadId: runtime.sessionId,
+        sessionRestorable: runtime.sessionLogPath !== null,
       });
     } catch (error) {
+      forgetAttachment(attachment);
       if (
         error instanceof MspRequestError &&
         (error.kind === "sessionNotFound" || error.kind === "sessionAmbiguous")
@@ -1270,31 +1617,8 @@ const handlers: Record<string, RequestHandler> = {
         );
         return;
       }
-      throw error;
+      constructionError(id, error);
     }
-    const session = registerSession({
-      threadId,
-      sessionId: result.session.sessionId,
-      host,
-      cwd,
-      approvalMode: result.session.approvalMode?.mode ?? "onRequest",
-      modelId: result.session.modelId,
-      sessionLogPath: result.session.path === "" ? null : result.session.path,
-      injectedTools: (parsed.data.dynamicTools ?? []).map((tool) => tool.name),
-      ...(options.instructions === undefined
-        ? {}
-        : { instructions: options.instructions }),
-    });
-    await reconcileSessionOptions(session, {
-      model: options.model,
-      permissionMode: options.permissionMode,
-      permissionScope: options.permissionScope,
-      approvalReviewer: options.approvalReviewer,
-    });
-    io.sendResult(id, {
-      providerThreadId: session.sessionId,
-      sessionRestorable: result.session.path !== "",
-    });
   },
 
   [BRIDGE_REQUEST_METHODS.threadFork]: async (id, params) => {
@@ -1303,7 +1627,6 @@ const handlers: Record<string, RequestHandler> = {
       invalidParams(id, BRIDGE_REQUEST_METHODS.threadFork, parsed.error.issues);
       return;
     }
-    const { threadId, cwd, options, sourceProviderThreadId } = parsed.data;
     if (parsed.data.sourceProviderCheckpointId !== undefined) {
       io.sendError(
         id,
@@ -1312,49 +1635,28 @@ const handlers: Record<string, RequestHandler> = {
       );
       return;
     }
-    await authRecoveryIfUnauthenticated();
-    const providerOptions = parseProviderOptions(options.providerOptions);
-    const host = await ensureHost({
-      posture: postureFrom(providerOptions, options),
-      cwd,
-      envVars: options.envVars,
-      recordThreadId: threadId,
+    const { threadId, cwd, options, sourceProviderThreadId } = parsed.data;
+    const attachment = registerAttachment({
       threadId,
-      dynamicTools: parsed.data.dynamicTools,
-    });
-    const result = await host.connection.request({
-      method: MSP_METHODS.sessionFork,
-      params: {
-        commandId: uuidV7(),
-        sessionId: sourceProviderThreadId,
-        excludeItems: true,
-      },
-      resultSchema: mspSessionResumeResultSchema,
-      timeoutMs: COMMAND_TIMEOUT_MS,
-    });
-    const session = registerSession({
-      threadId,
-      sessionId: result.session.sessionId,
-      host,
       cwd,
-      approvalMode: result.session.approvalMode?.mode ?? "onRequest",
-      modelId: result.session.modelId,
-      sessionLogPath: result.session.path === "" ? null : result.session.path,
-      injectedTools: (parsed.data.dynamicTools ?? []).map((tool) => tool.name),
-      ...(options.instructions === undefined
-        ? {}
-        : { instructions: options.instructions }),
+      options,
+      instructionMode: parsed.data.instructionMode,
+      dynamicTools: parsed.data.dynamicTools ?? [],
     });
-    await reconcileSessionOptions(session, {
-      model: options.model,
-      permissionMode: options.permissionMode,
-      permissionScope: options.permissionScope,
-      approvalReviewer: options.approvalReviewer,
-    });
-    io.sendResult(id, {
-      providerThreadId: session.sessionId,
-      sessionRestorable: result.session.path !== "",
-    });
+    try {
+      const runtime = await constructRuntime({
+        attachment,
+        options,
+        request: { kind: "fork", sourceProviderThreadId },
+      });
+      io.sendResult(id, {
+        providerThreadId: runtime.sessionId,
+        sessionRestorable: runtime.sessionLogPath !== null,
+      });
+    } catch (error) {
+      forgetAttachment(attachment);
+      constructionError(id, error);
+    }
   },
 
   [BRIDGE_REQUEST_METHODS.turnStart]: async (id, params) => {
@@ -1363,10 +1665,18 @@ const handlers: Record<string, RequestHandler> = {
       invalidParams(id, BRIDGE_REQUEST_METHODS.turnStart, parsed.error.issues);
       return;
     }
-    const session = requireSession(parsed.data.threadId);
+    const attachment = attachments.get(parsed.data.threadId);
+    if (attachment === undefined) {
+      io.sendError(
+        id,
+        BRIDGE_JSON_RPC_ERRORS.BRIDGE_ERROR,
+        `No Muse session for thread ${parsed.data.threadId}; send thread/start or thread/resume first`,
+      );
+      return;
+    }
     io.sendResult(id, {});
     await submitTurn({
-      session,
+      attachment,
       input: parsed.data.input,
       options: parsed.data.options,
       clientRequestId: parsed.data.clientRequestId,
@@ -1379,8 +1689,15 @@ const handlers: Record<string, RequestHandler> = {
       invalidParams(id, BRIDGE_REQUEST_METHODS.turnSteer, parsed.error.issues);
       return;
     }
-    const session = sessions.get(parsed.data.threadId);
-    if (session === undefined || !session.translator.hasOpenTurn(parsed.data.expectedTurnId)) {
+    const attachment = attachments.get(parsed.data.threadId);
+    const runtime = attachment?.runtime ?? null;
+    if (
+      attachment === undefined ||
+      runtime === null ||
+      runtime.closing ||
+      runtime.connection.exited ||
+      !runtime.openTurnIds.has(parsed.data.expectedTurnId)
+    ) {
       io.sendError(
         id,
         BRIDGE_JSON_RPC_ERRORS.NO_ACTIVE_TURN,
@@ -1388,41 +1705,45 @@ const handlers: Record<string, RequestHandler> = {
       );
       return;
     }
-    const input = await turnInputParts(parsed.data.input);
     try {
-      await session.host.connection.request({
+      const input = await turnInputParts(parsed.data.input);
+      const reasoningEffort = reasoningEffortFor(
+        parsed.data.options.reasoningLevel,
+      );
+      await runtime.connection.request({
         method: MSP_METHODS.turnSteer,
         params: {
           commandId: uuidV7(),
-          sessionId: session.sessionId,
+          sessionId: runtime.sessionId,
           expectedTurnId: parsed.data.expectedTurnId,
           input,
-          ...(reasoningEffortFor(parsed.data.options.reasoningLevel) === undefined
-            ? {}
-            : {
-                reasoningEffort: reasoningEffortFor(
-                  parsed.data.options.reasoningLevel,
-                ),
-              }),
+          ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
         },
         resultSchema: mspTurnSteerResultSchema,
         timeoutMs: COMMAND_TIMEOUT_MS,
       });
-    } catch (error) {
-      throw new BridgeRecoveryError({
-        code: BRIDGE_JSON_RPC_ERRORS.NO_ACTIVE_TURN,
-        message: error instanceof Error ? error.message : String(error),
-        recovery: {
-          kind: "staleTurn",
-          message: "The Muse turn this steer targeted is gone.",
-          retryable: false,
+      emitDeltas(attachment, [
+        {
+          kind: "input.accepted",
+          clientRequestId: parsed.data.clientRequestId,
+          providerTurnId: parsed.data.expectedTurnId,
         },
-      });
+      ]);
+      io.sendResult(id, {});
+    } catch (error) {
+      io.sendError(
+        id,
+        BRIDGE_JSON_RPC_ERRORS.NO_ACTIVE_TURN,
+        error instanceof Error ? error.message : String(error),
+        {
+          recovery: {
+            kind: "staleTurn",
+            message: "The Muse turn this steer targeted is gone.",
+            retryable: false,
+          },
+        },
+      );
     }
-    io.sendResult(id, {});
-    emitDeltas(session.threadId, [
-      { kind: "input.accepted", clientRequestId: parsed.data.clientRequestId },
-    ]);
   },
 
   [BRIDGE_REQUEST_METHODS.threadStop]: async (id, params) => {
@@ -1432,27 +1753,22 @@ const handlers: Record<string, RequestHandler> = {
       return;
     }
     const { threadId, intent, activeTurnId } = parsed.data;
-    const session = sessions.get(threadId);
-    if (session === undefined) {
+    const attachment = attachments.get(threadId);
+    if (attachment === undefined) {
       io.sendResult(id, {});
       return;
     }
 
     if (intent === "interrupt") {
-      await interruptSession(session, activeTurnId);
+      await interruptAttachment(attachment, activeTurnId);
     }
 
-    try {
-      await session.host.connection.request({
-        method: MSP_METHODS.viewUnsubscribe,
-        params: { sessionId: session.sessionId },
-        resultSchema: mspEmptyResultSchema,
-        timeoutMs: COMMAND_TIMEOUT_MS,
-      });
-    } catch {
-      /** An unsubscribe that cannot land costs nothing: the host is going away. */
-    }
-    forgetSession(session);
+    /**
+     * `release` detaches an idle session and must fabricate nothing. The child
+     * stays alive so a later turn keeps this session's route; it is reclaimed by
+     * the idle timer, by `thread/discard`, or when the bridge shuts down.
+     */
+    scheduleIdleShutdown(attachment);
     io.sendResult(id, {});
   },
 
@@ -1466,284 +1782,53 @@ const handlers: Record<string, RequestHandler> = {
       );
       return;
     }
-    const session = sessions.get(parsed.data.threadId);
-    if (session !== undefined) {
-      forgetSession(session);
+    const attachment = attachments.get(parsed.data.threadId);
+    if (attachment !== undefined) {
+      forgetAttachment(attachment);
     }
     io.sendResult(id, {});
   },
 };
 
-function cancelIdleShutdown(host: MuseHost): void {
-  if (host.idleTimer !== null) {
-    clearTimeout(host.idleTimer);
-    host.idleTimer = null;
-  }
-}
-
-function scheduleIdleShutdown(host: MuseHost): void {
-  cancelIdleShutdown(host);
-  host.idleTimer = setTimeout(() => {
-    host.idleTimer = null;
-    if (host.threadIds.size > 0) {
-      return;
-    }
-    hosts.delete(host.signature);
-    host.connection.kill();
-  }, HOST_IDLE_SHUTDOWN_MS);
-  host.idleTimer.unref?.();
-}
-
-function forgetSession(session: MuseSession): void {
-  sessions.delete(session.threadId);
-  sessionsByMuseId.delete(session.sessionId);
-  session.host.threadIds.delete(session.threadId);
-  if (session.host.threadIds.size > 0) {
-    return;
-  }
-  if (session.host.signature.includes("|thread:")) {
-    cancelIdleShutdown(session.host);
-    hosts.delete(session.host.signature);
-    session.host.connection.kill();
-    return;
-  }
-  scheduleIdleShutdown(session.host);
-}
-
-async function interruptSession(
-  session: MuseSession,
+async function interruptAttachment(
+  attachment: MuseAttachment,
   activeTurnId: string | null,
 ): Promise<void> {
-  const openTurns = session.translator.openTurns;
+  const runtime = attachment.runtime;
+  if (runtime === null || runtime.closing || runtime.connection.exited) {
+    return;
+  }
+  const openTurns = [...runtime.openTurnIds];
   if (openTurns.length === 0) {
     return;
   }
-  const settled = new Promise<void>((resolve) => {
-    const waiter = () => {
-      resolve();
-    };
-    session.interruptWaiters.add(waiter);
-    const timeout = setTimeout(() => {
-      session.interruptWaiters.delete(waiter);
-      resolve();
-    }, INTERRUPT_SETTLE_TIMEOUT_MS);
-    timeout.unref?.();
-  });
+  const turnId = activeTurnId ?? openTurns[0];
 
   try {
-    await session.host.connection.request({
+    await runtime.connection.request({
       method: MSP_METHODS.turnInterrupt,
       params: {
         commandId: uuidV7(),
-        sessionId: session.sessionId,
+        sessionId: runtime.sessionId,
         ...(activeTurnId === null ? {} : { turnId: activeTurnId }),
       },
       resultSchema: mspTurnInterruptResultSchema,
       timeoutMs: COMMAND_TIMEOUT_MS,
     });
   } catch {
-    /** Fall through to the local settlement below. */
+    /** Settle locally below; a stop must not wait on a failed interrupt. */
   }
 
-  await settled;
-  emitDeltas(
-    session.threadId,
-    session.translator.settleOpenTurns("interrupted", "Interrupted by bb"),
+  const settled = await waitForTurnSettlement(
+    runtime,
+    turnId,
+    INTERRUPT_SETTLE_TIMEOUT_MS,
   );
-}
-
-/**
- * bb states how an agent should behave inside it — that the `bb` CLI exists,
- * that `bb thread` reads other threads, whatever the user's plugins add — as
- * session instructions. MSP has no system-prompt slot, so they ride the first
- * turn the way the Claude bridge delivers them, wrapped so the model reads them
- * as instructions rather than as something the user typed.
- *
- * `displayText` carries the user's own prompt, so the transcript shows what
- * they wrote and not the instruction block.
- */
-export function withInstructions(
-  parts: readonly { type: "text" | "image"; [key: string]: unknown }[],
-  instructions: string | null,
-): { type: "text" | "image"; [key: string]: unknown }[] {
-  if (instructions === null || instructions.trim() === "") {
-    return [...parts];
-  }
-  return [
-    {
-      type: "text",
-      text: `<system_instructions>
-${instructions.trim()}
-</system_instructions>`,
-    },
-    ...parts,
-  ];
-}
-
-function promptDisplayText(input: readonly PromptInput[]): string | undefined {
-  const text = input
-    .filter((item): item is Extract<PromptInput, { type: "text" }> =>
-      item.type === "text",
-    )
-    .map((item) => item.text)
-    .join("")
-    .trim();
-  return text === "" ? undefined : text;
-}
-
-async function submitTurn(args: {
-  session: MuseSession;
-  input: readonly PromptInput[];
-  options: z.infer<typeof turnStartParamsSchema>["options"];
-  clientRequestId?: string;
-}): Promise<void> {
-  const { session, options } = args;
-  if (args.clientRequestId !== undefined) {
-    emitDeltas(session.threadId, [
-      { kind: "input.accepted", clientRequestId: args.clientRequestId },
-    ]);
-  }
-
-  if (isStandaloneBuiltinCompactCommand(args.input)) {
-    await compactSession(session);
-    return;
-  }
-
-  try {
-    const live = await replaceSessionIfNeeded(session);
-    await reconcileSessionOptions(live, {
-      model: options.model,
-      permissionMode: options.permissionMode,
-      permissionScope: options.permissionScope,
-      approvalReviewer: options.approvalReviewer,
-    });
-    const instructions = live.pendingInstructions;
-    const input = withInstructions(
-      await turnInputParts(args.input),
-      instructions,
+  if (!settled) {
+    emitDeltas(
+      attachment,
+      runtime.translator.settleOpenTurns("interrupted", "Interrupted by bb"),
     );
-    const displayText =
-      instructions === null ? undefined : promptDisplayText(args.input);
-    const reasoningEffort = reasoningEffortFor(options.reasoningLevel);
-    await live.host.connection.request({
-      method: MSP_METHODS.turnStart,
-      params: {
-        commandId: uuidV7(),
-        sessionId: live.sessionId,
-        input,
-        ifBusy: "queue",
-        ...(displayText === undefined ? {} : { displayText }),
-        ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
-      },
-      resultSchema: mspTurnStartResultSchema,
-      timeoutMs: COMMAND_TIMEOUT_MS,
-    });
-    live.pendingInstructions = null;
-  } catch (error) {
-    /**
-     * Accepted input that never settles leaves bb refusing every later turn on
-     * the thread ("another turn is active or starting"), so every failure on the
-     * submit path — not just a rejected `turn/start` — closes the turn here.
-     */
-    const message = error instanceof Error ? error.message : String(error);
-    emitDeltas(session.threadId, [
-      {
-        kind: "provider.error",
-        message,
-        settlesTurn: true,
-      },
-      { kind: "turn.boundary", status: "failed", claimIfIdle: true, error: { message } },
-    ]);
-    if (error instanceof MspExitedError) {
-      notify(BRIDGE_NOTIFICATION_METHODS.providerRecovery, {
-        threadId: session.threadId,
-        kind: "restartRecommended",
-        message,
-        retryable: true,
-      });
-    }
-  }
-}
-
-/**
- * Rebuilds a session Muse can no longer run, keeping the bb thread. The
- * UltraGoal, findings, and every other durable record live on bb's side, so a
- * fresh provider session costs the in-session conversation and nothing else —
- * and `session/replaced` is how the protocol says to report exactly that.
- */
-async function replaceSessionIfNeeded(
-  session: MuseSession,
-): Promise<MuseSession> {
-  const reason = session.needsReplacement;
-  if (reason === null) {
-    return session;
-  }
-  session.needsReplacement = null;
-
-  try {
-    const result = await session.host.connection.request({
-      method: MSP_METHODS.sessionStart,
-      params: {
-        commandId: uuidV7(),
-        workspaceRoot: session.cwd,
-        approvalMode: session.approvalMode,
-        ...(session.modelId === null ? {} : { modelId: session.modelId }),
-      },
-      resultSchema: mspSessionStartResultSchema,
-      timeoutMs: COMMAND_TIMEOUT_MS,
-    });
-    const replacement = registerSession({
-      threadId: session.threadId,
-      sessionId: result.session.sessionId,
-      host: session.host,
-      cwd: session.cwd,
-      approvalMode: session.approvalMode,
-      modelId: result.session.modelId,
-      sessionLogPath: result.session.path === "" ? null : result.session.path,
-      injectedTools: [...session.injectedTools],
-      ...(session.pendingInstructions === null
-        ? {}
-        : { instructions: session.pendingInstructions }),
-    });
-    notify(BRIDGE_NOTIFICATION_METHODS.sessionReplaced, {
-      threadId: session.threadId,
-      providerThreadId: replacement.sessionId,
-      reason,
-      contextLost: true,
-    });
-    emitDeltas(session.threadId, [
-      {
-        kind: "provider.warning",
-        summary: "Muse started a fresh session for this thread",
-        details: `${reason}. Durable bb state is untouched; the in-session conversation is not.`,
-      },
-    ]);
-    return replacement;
-  } catch {
-    /** A failed replacement leaves the old session to report its own error. */
-    return session;
-  }
-}
-
-async function compactSession(session: MuseSession): Promise<void> {
-  try {
-    await session.host.connection.request({
-      method: MSP_METHODS.sessionCompact,
-      params: { commandId: uuidV7(), sessionId: session.sessionId },
-      resultSchema: mspCommandAckSchema,
-      timeoutMs: COMMAND_TIMEOUT_MS,
-    });
-    emitDeltas(session.threadId, [
-      { kind: "turn.open" },
-      { kind: "turn.boundary", status: "completed" },
-    ]);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    emitDeltas(session.threadId, [
-      { kind: "provider.error", message, settlesTurn: true },
-      { kind: "turn.open" },
-      { kind: "turn.boundary", status: "failed", error: { message } },
-    ]);
   }
 }
 
@@ -1754,7 +1839,11 @@ export function handleLine(line: string): void {
   } catch {
     return;
   }
-  if (typeof message !== "object" || message === null || Array.isArray(message)) {
+  if (
+    typeof message !== "object" ||
+    message === null ||
+    Array.isArray(message)
+  ) {
     return;
   }
   const { id, method, params } = message as {
@@ -1807,13 +1896,11 @@ export function handleLine(line: string): void {
 function shutdown(): void {
   toolProxy?.close();
   toolProxy = null;
-  for (const host of hosts.values()) {
-    cancelIdleShutdown(host);
-    host.connection.kill();
+  maintenanceConnection?.kill();
+  maintenanceConnection = null;
+  for (const attachment of [...attachments.values()]) {
+    forgetAttachment(attachment);
   }
-  hosts.clear();
-  sessions.clear();
-  sessionsByMuseId.clear();
 }
 
 export const experimental_providerBridge = experimental_defineProviderBridge({

@@ -330,7 +330,6 @@ describe("todo lists", () => {
 
 describe("model catalog", () => {
   it("titles a model whose label is only its id", async () => {
-    process.env.BB_MUSE_EXECUTABLE = "/nonexistent/muse";
     const { museModelDisplayName } = await import("../src/provider-bridge.js");
     expect(
       museModelDisplayName({
@@ -374,7 +373,6 @@ describe("permission policy", () => {
   });
 
   it("matches an MCP tool name back to the tool bb declared", async () => {
-    process.env.BB_MUSE_EXECUTABLE = "/nonexistent/muse";
     const { stripMcpPrefix } = await import("../src/provider-bridge.js");
     expect(stripMcpPrefix("mcp__bb_bridge__ultragoal_state")).toBe(
       "ultragoal_state",
@@ -388,7 +386,6 @@ describe("permission policy", () => {
 
 describe("session instructions", () => {
   it("delivers bb's instructions ahead of the user's prompt", async () => {
-    process.env.BB_MUSE_EXECUTABLE = "/nonexistent/muse";
     const { withInstructions } = await import("../src/provider-bridge.js");
     const parts = withInstructions(
       [{ type: "text", text: "Continue from @thread:thr_x" }],
@@ -411,32 +408,44 @@ describe("session instructions", () => {
   });
 });
 
-describe("unrecoverable session history", () => {
-  it("recognises the route-change failure Muse cannot recover from", async () => {
-    process.env.BB_MUSE_EXECUTABLE = "/nonexistent/muse";
-    const { replaceableTurnFailure } = await import(
-      "../src/provider-bridge.js"
+describe("turn failure classification", () => {
+  const failed = (message: string) => ({
+    sessionId: "s",
+    turnId: "t",
+    terminal: "failed",
+    error: { kind: "modelError", message, retryable: false },
+  });
+
+  it("asks for a fresh session when Muse cannot replay its own history", async () => {
+    const { classifyTurnFailure } = await import("../src/recovery.js");
+    const classified = classifyTurnFailure(
+      failed(
+        "provider-private history is incompatible with the active route: reasoning replay `rs_a:rs_b` has no provider attribution after a provider switch; start a fresh turn without opaque reasoning history",
+      ),
     );
-    const failed = (message: string) => ({
-      sessionId: "s",
-      turnId: "t",
-      terminal: "failed",
-      error: { kind: "modelError", message, retryable: false },
+    expect(classified.restart).toMatchObject({ fresh: true });
+    expect(classified.hint).toBeNull();
+  });
+
+  it("types an expired login and a rate limit for bb to act on", async () => {
+    const { classifyTurnFailure } = await import("../src/recovery.js");
+    expect(
+      classifyTurnFailure(failed("request failed: 401 unauthorized")).hint,
+    ).toMatchObject({ kind: "authRequired" });
+    expect(
+      classifyTurnFailure(failed("429 rate limit reached for this account"))
+        .hint,
+    ).toMatchObject({ kind: "rateLimited" });
+  });
+
+  it("leaves an ordinary failure alone", async () => {
+    const { classifyTurnFailure } = await import("../src/recovery.js");
+    expect(classifyTurnFailure(failed("step limit exceeded"))).toEqual({
+      restart: null,
+      hint: null,
     });
     expect(
-      replaceableTurnFailure(
-        failed(
-          "provider-private history is incompatible with the active route: reasoning replay `rs_a:rs_b` has no provider attribution after a provider switch; start a fresh turn without opaque reasoning history",
-        ),
-      ),
-    ).not.toBeNull();
-    expect(replaceableTurnFailure(failed("model overloaded"))).toBeNull();
-    expect(
-      replaceableTurnFailure({
-        sessionId: "s",
-        turnId: "t",
-        terminal: "completed",
-      }),
-    ).toBeNull();
+      classifyTurnFailure({ sessionId: "s", turnId: "t", terminal: "completed" }),
+    ).toEqual({ restart: null, hint: null });
   });
 });

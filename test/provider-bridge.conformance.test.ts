@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, expect, it } from "vitest";
+import { afterAll, afterEach, beforeEach, expect, it } from "vitest";
 import {
   experimental_captureBridgeJsonRpcOutput as captureBridgeJsonRpcOutput,
   experimental_formatConformanceReport as formatConformanceReport,
@@ -12,6 +12,12 @@ import {
 
 const fixtureDir = dirname(fileURLToPath(import.meta.url));
 
+/**
+ * Scoped to this file: a leaked executable override would send another suite's
+ * bridge at the scripted host instead of the real binary.
+ */
+const previousExecutable = process.env.BB_MUSE_EXECUTABLE;
+const previousApiKey = process.env.META_API_KEY;
 process.env.BB_MUSE_EXECUTABLE = join(fixtureDir, "fake-muse-serve.mjs");
 process.env.META_API_KEY = "conformance-key";
 
@@ -28,6 +34,19 @@ beforeEach(() => {
 afterEach(() => {
   output.restore();
   rmSync(workspaceDir, { recursive: true, force: true });
+});
+
+afterAll(() => {
+  if (previousExecutable === undefined) {
+    delete process.env.BB_MUSE_EXECUTABLE;
+  } else {
+    process.env.BB_MUSE_EXECUTABLE = previousExecutable;
+  }
+  if (previousApiKey === undefined) {
+    delete process.env.META_API_KEY;
+  } else {
+    process.env.META_API_KEY = previousApiKey;
+  }
 });
 
 it("passes the canonical protocol suite", async () => {

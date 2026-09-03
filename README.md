@@ -34,6 +34,23 @@ it stays warm for a minute after the last thread detaches.
 | subagents | `subagent` items → delegation rows |
 | bb's injected tools | an MCP server the bridge proxies back to bb |
 
+## How it matches the first-party bridges
+
+The bridge is built on the same two layers codex and Claude Code use. An
+**attachment** is what bb owns — one per thread, durable while bb holds the
+thread, carrying the provider session id, the construction inputs, and any
+rebuild that is owed. A **runtime** is the live `muse serve` child and the
+session loaded in it, replaced whenever the child dies, the execution options
+change, or Muse refuses to carry on. One child per thread, as codex runs one
+app-server per session, so no thread can disturb another's configuration.
+
+Everything that follows from that is theirs too: a serial on every runtime so a
+late callback cannot mutate the session that replaced it; deltas buffered until
+`thread/identity` is announced; a turn that always settles, including a prompt
+the provider handles without doing any work; `session/replaced` on every
+rebuild; typed recovery hints for an expired login or a rate limit; and model
+listing on a child of its own so a catalog read never disturbs a thread.
+
 ## Sessions, routes, and recovery
 
 A Muse session's route belongs to the `muse serve` process that opened it, and
@@ -43,11 +60,17 @@ with `provider-private history is incompatible with the active route` — durabl
 because the offending reasoning item stays in the session. Compaction does not
 clear it.
 
-The bridge handles this from both ends. A host outlives ordinary idleness by a
-wide margin, so a thread idling between turns is never recycled underneath. And
-when the failure does happen — after a bridge restart, say — the next turn
-rebuilds the session and reports `session/replaced` with `contextLost`, since
-the UltraGoal, findings, and every other durable record live on bb's side.
+This is where the bridge departs from codex, and it has to. Codex kills its
+child on `thread/stop { release }` because resuming a rollout is clean; Muse's
+resume is not, so a thread's child outlives ordinary release and is reclaimed
+only on `thread/discard`, on bridge shutdown, or after a long idle.
+
+When a rebuild is unavoidable anyway — the child died, bb restarted the bridge —
+the session is resumed first, because a session that never produced opaque
+reasoning resumes fine. If Muse then refuses the history, the next turn starts a
+fresh session and reports `session/replaced` with `contextLost`: the UltraGoal,
+findings, and every other durable record live on bb's side, so only the
+in-session conversation is lost.
 
 ## Why Muse's OS sandbox defaults to off
 

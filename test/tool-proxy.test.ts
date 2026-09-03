@@ -231,7 +231,6 @@ describe("sandbox posture", () => {
 
 describe("host config isolation", () => {
   it("gives the same tool set a stable signature and a different one a new key", async () => {
-    process.env.BB_MUSE_EXECUTABLE = "/nonexistent/muse";
     const { toolsSignature } = await import("../src/provider-bridge.js");
     const a = [
       { name: "b_tool", description: "", inputSchema: {} },
