@@ -24,13 +24,28 @@ it stays warm for a minute after the last thread detaches.
 | `thread/start` / `resume` / `fork` | `session/start` / `session/resume` / `session/fork` |
 | `turn/start`, `turn/steer` | `turn/start`, `turn/steer` (injected into the running turn) |
 | `thread/stop { interrupt }` | `turn/interrupt`, settled before the stop is answered |
-| permission mode `accept-edits` / `auto` / `full` | approval mode `promptUnmatched` / `onRequest` / `allowAll` |
+| permission mode `full` | approval mode `allowAll`, Muse's sandbox off |
+| permission mode `auto` (bb reviews) | approval mode `allowAll`, sandbox on |
+| permission mode `accept-edits` (you review) | approval mode `onRequest` |
 | approval prompts | `approval/requested` → `approval/decide` |
 | user questions | `userInput/requested` → `answer` / `clarify` / `cancel` |
 | `/compact` | `session/compact` |
 | todo snapshots | `session/todoListChanged` → plan-steps rows |
 | subagents | `subagent` items → delegation rows |
 | bb's injected tools | an MCP server the bridge proxies back to bb |
+
+## Permission modes
+
+bb states a permission policy, not a prompt budget. `full` is full access, so
+Muse stops asking and its own sandbox stands down — the posture every provider
+bb ships takes for that mode. `auto` names bb, not you, as the reviewer, so Muse
+stops asking there too while keeping its sandbox. Only `accept-edits`, where you
+are the reviewer, leaves Muse asking.
+
+Two approvals are never shown, because they are the bridge asking permission to
+be itself: Muse's sandbox gating the loopback connection to the tool proxy this
+plugin started, and Muse gating a tool bb injected — which bb already governs on
+its own side.
 
 ## bb's own tools
 

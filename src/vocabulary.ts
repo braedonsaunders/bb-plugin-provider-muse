@@ -40,11 +40,32 @@ export const museProviderOptionsSchema = z.object({
 });
 export type MuseProviderOptions = z.infer<typeof museProviderOptionsSchema>;
 
-export const MUSE_APPROVAL_MODES = {
-  "accept-edits": "promptUnmatched",
-  auto: "onRequest",
-  full: "allowAll",
-} as const;
+/**
+ * bb states a permission policy, not an approval prompt count. `full` is full
+ * access, and `auto` names bb — not the user — as the reviewer; in both, a
+ * prompt per command is the provider failing to honour the policy. Only
+ * `accept-edits`, where the reviewer is the user, leaves Muse asking.
+ *
+ * Muse's sandbox is a separate constraint from its approval mode, so a
+ * workspace-scoped session keeps the sandbox that bb's scope implies while
+ * Muse stops asking.
+ */
+export function museApprovalMode(policy: {
+  permissionMode: string;
+  permissionScope?: string;
+  approvalReviewer?: string | null;
+}): "allowAll" | "onRequest" {
+  if (policy.permissionScope === "full" || policy.permissionMode === "full") {
+    return "allowAll";
+  }
+  if (
+    policy.approvalReviewer === "automatic" ||
+    policy.permissionMode === "auto"
+  ) {
+    return "allowAll";
+  }
+  return "onRequest";
+}
 
 /**
  * Muse Code offers four efforts — low, medium, high, x-high — and defaults to

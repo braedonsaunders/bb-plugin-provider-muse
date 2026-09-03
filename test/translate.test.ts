@@ -346,3 +346,42 @@ describe("model catalog", () => {
     ).toBe("Muse Spark 1.3 Preview");
   });
 });
+
+describe("permission policy", () => {
+  it("stops asking whenever bb, not the user, is the reviewer", async () => {
+    const { museApprovalMode } = await import("../src/vocabulary.js");
+    expect(
+      museApprovalMode({
+        permissionMode: "full",
+        permissionScope: "full",
+        approvalReviewer: null,
+      }),
+    ).toBe("allowAll");
+    expect(
+      museApprovalMode({
+        permissionMode: "auto",
+        permissionScope: "workspace",
+        approvalReviewer: "automatic",
+      }),
+    ).toBe("allowAll");
+    expect(
+      museApprovalMode({
+        permissionMode: "accept-edits",
+        permissionScope: "workspace",
+        approvalReviewer: "user",
+      }),
+    ).toBe("onRequest");
+  });
+
+  it("matches an MCP tool name back to the tool bb declared", async () => {
+    process.env.BB_MUSE_EXECUTABLE = "/nonexistent/muse";
+    const { stripMcpPrefix } = await import("../src/provider-bridge.js");
+    expect(stripMcpPrefix("mcp__bb_bridge__ultragoal_state")).toBe(
+      "ultragoal_state",
+    );
+    expect(stripMcpPrefix("mcp__bb_bridge.ultragoal_state")).toBe(
+      "ultragoal_state",
+    );
+    expect(stripMcpPrefix("muse.bash")).toBe("muse.bash");
+  });
+});

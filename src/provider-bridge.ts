@@ -86,10 +86,10 @@ import {
 import { MUSE_TOOL_PROXY_SCRIPT } from "./tool-proxy/script.js";
 import { MuseTranslator } from "./translate.js";
 import {
-  MUSE_APPROVAL_MODES,
   MUSE_DEFAULT_REASONING_LEVEL,
   MUSE_REASONING_EFFORTS,
   MUSE_SESSION_EXTENSION_KIND,
+  museApprovalMode,
   museProviderOptionsSchema,
   type MuseProviderOptions,
 } from "./vocabulary.js";
@@ -166,6 +166,7 @@ interface MuseSession {
   approvalMode: string;
   modelId: string | null;
   sessionLogPath: string | null;
+  injectedTools: Set<string>;
   pendingApprovals: Map<string, MspApprovalRequestParams>;
   pendingUserInputs: Map<string, MspUserInputRequestParams>;
   interruptWaiters: Set<() => void>;
@@ -242,9 +243,12 @@ async function runInjectedTool(call: {
   };
 }
 
-function postureFrom(options: MuseProviderOptions): HostPosture {
+function postureFrom(
+  options: MuseProviderOptions,
+  policy: PermissionPolicy,
+): HostPosture {
   return {
-    disableSandbox: options.disableSandbox === true,
+    disableSandbox: options.disableSandbox === true || fullAccess(policy),
     sandboxNetwork: options.sandboxNetwork ?? "proxy-only",
     trustWorkspace: options.trustWorkspace !== false,
   };
@@ -547,6 +551,43 @@ function sessionStateDelta(session: MuseSession): ThreadDelta {
   };
 }
 
+/**
+ * bb's own plumbing must not read as a decision for the user. Two approvals are
+ * the bridge asking permission to be itself: Muse's sandbox gating the loopback
+ * connection to the tool proxy this bridge started, and Muse gating a tool bb
+ * injected — which bb already governs on its own side, before it ever reaches
+ * the runtime. Both are approved here rather than shown.
+ */
+function isBridgeInfrastructureApproval(
+  session: MuseSession,
+  request: MspApprovalRequestParams,
+): boolean {
+  const subject = request.subject;
+  if (
+    subject.kind === "network" &&
+    (subject.host === "127.0.0.1" || subject.host === "localhost") &&
+    toolProxy !== null &&
+    subject.port === toolProxy.port
+  ) {
+    return true;
+  }
+  const tool = subject.toolName ?? request.toolName;
+  return session.injectedTools.has(stripMcpPrefix(tool));
+}
+
+/**
+ * Muse namespaces an MCP tool as `mcp__<server>__<tool>` (and shows it dotted),
+ * so a name is matched back to the tool bb declared.
+ */
+export function stripMcpPrefix(tool: string): string {
+  const match = /^mcp__[^_]+(?:_[^_]+)*?__(?<name>.+)$/u.exec(tool);
+  if (match?.groups?.name !== undefined) {
+    return match.groups.name;
+  }
+  const dotted = /^mcp__[A-Za-z0-9_]+\.(?<name>.+)$/u.exec(tool);
+  return dotted?.groups?.name ?? tool;
+}
+
 function openApprovalInteraction(session: MuseSession, params: unknown): void {
   const parsed = mspApprovalRequestParamsSchema.safeParse(params);
   if (!parsed.success) {
@@ -554,6 +595,10 @@ function openApprovalInteraction(session: MuseSession, params: unknown): void {
   }
   const request = parsed.data;
   if (session.pendingApprovals.has(request.approvalId)) {
+    return;
+  }
+  if (isBridgeInfrastructureApproval(session, request)) {
+    void decideApproval(session, request, { decision: "allow_for_session" });
     return;
   }
   const payload = approvalPayloadFromMsp(request);
@@ -736,18 +781,27 @@ function reasoningEffortFor(level: string | undefined): string | undefined {
   return MUSE_REASONING_EFFORTS[level as keyof typeof MUSE_REASONING_EFFORTS];
 }
 
-function approvalModeFor(permissionMode: string): string {
-  return (
-    MUSE_APPROVAL_MODES[permissionMode as keyof typeof MUSE_APPROVAL_MODES] ??
-    "onRequest"
-  );
+type PermissionPolicy = {
+  permissionMode: string;
+  permissionScope?: string;
+  approvalReviewer?: string | null;
+};
+
+function approvalModeFor(policy: PermissionPolicy): string {
+  return museApprovalMode(policy);
+}
+
+/** Full access means Muse's own sandbox stands down too, the way it does for
+ * every other provider bb ships. */
+function fullAccess(policy: PermissionPolicy): boolean {
+  return policy.permissionScope === "full" || policy.permissionMode === "full";
 }
 
 async function reconcileSessionOptions(
   session: MuseSession,
-  options: { model?: string; permissionMode: string },
+  options: { model?: string } & PermissionPolicy,
 ): Promise<void> {
-  const approvalMode = approvalModeFor(options.permissionMode);
+  const approvalMode = approvalModeFor(options);
   if (approvalMode !== session.approvalMode) {
     await session.host.connection.request({
       method: MSP_METHODS.sessionSetApprovalMode,
@@ -784,6 +838,7 @@ function registerSession(args: {
   approvalMode: string;
   modelId: string | null;
   sessionLogPath: string | null;
+  injectedTools?: readonly string[];
 }): MuseSession {
   const previous = sessions.get(args.threadId);
   if (previous !== undefined) {
@@ -799,6 +854,7 @@ function registerSession(args: {
     approvalMode: args.approvalMode,
     modelId: args.modelId,
     sessionLogPath: args.sessionLogPath,
+    injectedTools: new Set(args.injectedTools ?? []),
     pendingApprovals: new Map(),
     pendingUserInputs: new Map(),
     interruptWaiters: new Set(),
@@ -883,7 +939,7 @@ function modelFromCatalog(entry: MspModelCatalogEntry): AvailableModel {
 
 async function listModels(cwd: string): Promise<AvailableModel[]> {
   const host = await ensureHost({
-    posture: postureFrom({}),
+    posture: postureFrom({}, { permissionMode: "auto" }),
     cwd,
     recordThreadId: null,
   });
@@ -1034,14 +1090,14 @@ const handlers: Record<string, RequestHandler> = {
     await authRecoveryIfUnauthenticated();
     const providerOptions = parseProviderOptions(options.providerOptions);
     const host = await ensureHost({
-      posture: postureFrom(providerOptions),
+      posture: postureFrom(providerOptions, options),
       cwd,
       envVars: options.envVars,
       recordThreadId: threadId,
       threadId,
       dynamicTools: parsed.data.dynamicTools,
     });
-    const approvalMode = approvalModeFor(options.permissionMode);
+    const approvalMode = approvalModeFor(options);
     const result = await host.connection.request({
       method: MSP_METHODS.sessionStart,
       params: {
@@ -1061,6 +1117,7 @@ const handlers: Record<string, RequestHandler> = {
       approvalMode,
       modelId: result.session.modelId,
       sessionLogPath: result.session.path === "" ? null : result.session.path,
+      injectedTools: (parsed.data.dynamicTools ?? []).map((tool) => tool.name),
     });
     io.sendResult(id, {
       providerThreadId: session.sessionId,
@@ -1085,7 +1142,7 @@ const handlers: Record<string, RequestHandler> = {
     await authRecoveryIfUnauthenticated();
     const providerOptions = parseProviderOptions(options.providerOptions);
     const host = await ensureHost({
-      posture: postureFrom(providerOptions),
+      posture: postureFrom(providerOptions, options),
       cwd,
       envVars: options.envVars,
       recordThreadId: threadId,
@@ -1126,10 +1183,13 @@ const handlers: Record<string, RequestHandler> = {
       approvalMode: result.session.approvalMode?.mode ?? "onRequest",
       modelId: result.session.modelId,
       sessionLogPath: result.session.path === "" ? null : result.session.path,
+      injectedTools: (parsed.data.dynamicTools ?? []).map((tool) => tool.name),
     });
     await reconcileSessionOptions(session, {
       model: options.model,
       permissionMode: options.permissionMode,
+      permissionScope: options.permissionScope,
+      approvalReviewer: options.approvalReviewer,
     });
     io.sendResult(id, {
       providerThreadId: session.sessionId,
@@ -1155,7 +1215,7 @@ const handlers: Record<string, RequestHandler> = {
     await authRecoveryIfUnauthenticated();
     const providerOptions = parseProviderOptions(options.providerOptions);
     const host = await ensureHost({
-      posture: postureFrom(providerOptions),
+      posture: postureFrom(providerOptions, options),
       cwd,
       envVars: options.envVars,
       recordThreadId: threadId,
@@ -1180,10 +1240,13 @@ const handlers: Record<string, RequestHandler> = {
       approvalMode: result.session.approvalMode?.mode ?? "onRequest",
       modelId: result.session.modelId,
       sessionLogPath: result.session.path === "" ? null : result.session.path,
+      injectedTools: (parsed.data.dynamicTools ?? []).map((tool) => tool.name),
     });
     await reconcileSessionOptions(session, {
       model: options.model,
       permissionMode: options.permissionMode,
+      permissionScope: options.permissionScope,
+      approvalReviewer: options.approvalReviewer,
     });
     io.sendResult(id, {
       providerThreadId: session.sessionId,
@@ -1408,6 +1471,8 @@ async function submitTurn(args: {
     await reconcileSessionOptions(session, {
       model: options.model,
       permissionMode: options.permissionMode,
+      permissionScope: options.permissionScope,
+      approvalReviewer: options.approvalReviewer,
     });
     const input = await turnInputParts(args.input);
     const reasoningEffort = reasoningEffortFor(options.reasoningLevel);
