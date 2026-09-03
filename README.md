@@ -34,6 +34,21 @@ it stays warm for a minute after the last thread detaches.
 | subagents | `subagent` items → delegation rows |
 | bb's injected tools | an MCP server the bridge proxies back to bb |
 
+## Sessions, routes, and recovery
+
+A Muse session's route belongs to the `muse serve` process that opened it, and
+Muse cannot replay its own encrypted reasoning across a route change. Resume a
+session on a second process and its next model call after a tool result fails
+with `provider-private history is incompatible with the active route` — durably,
+because the offending reasoning item stays in the session. Compaction does not
+clear it.
+
+The bridge handles this from both ends. A host outlives ordinary idleness by a
+wide margin, so a thread idling between turns is never recycled underneath. And
+when the failure does happen — after a bridge restart, say — the next turn
+rebuilds the session and reports `session/replaced` with `contextLost`, since
+the UltraGoal, findings, and every other durable record live on bb's side.
+
 ## Why Muse's OS sandbox defaults to off
 
 Muse's sandbox is all or nothing: `muse serve` offers `--disable-sandbox` and no

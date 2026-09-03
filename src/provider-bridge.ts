@@ -65,6 +65,7 @@ import {
   mspSessionResumeResultSchema,
   mspSessionStartResultSchema,
   mspTurnInterruptResultSchema,
+  mspTurnCompletedParamsSchema,
   mspTurnStartResultSchema,
   mspTurnSteerResultSchema,
   mspUserInputRequestParamsSchema,
@@ -100,11 +101,14 @@ const CLIENT_VERSION = "1";
 const HANDSHAKE_TIMEOUT_MS = 30_000;
 /**
  * One `muse serve` process hosts every session that shares its sandbox posture.
- * Keeping it briefly after the last thread detaches makes stop-then-resume — and
- * the next thread in the same workspace — reuse a warm host instead of paying
- * for a fresh handshake.
+ *
+ * A session's route belongs to its host process, and Muse cannot replay its own
+ * encrypted reasoning across a route change, so recycling a host under a thread
+ * that is merely idle between turns is what breaks long-running work. The host
+ * therefore outlives ordinary idleness by a wide margin and is reclaimed only
+ * when a thread is genuinely done with it.
  */
-const HOST_IDLE_SHUTDOWN_MS = 60_000;
+const HOST_IDLE_SHUTDOWN_MS = 30 * 60_000;
 const COMMAND_TIMEOUT_MS = 120_000;
 const INTERRUPT_SETTLE_TIMEOUT_MS = 8_000;
 
@@ -169,6 +173,7 @@ interface MuseSession {
   sessionLogPath: string | null;
   injectedTools: Set<string>;
   pendingInstructions: string | null;
+  needsReplacement: string | null;
   pendingApprovals: Map<string, MspApprovalRequestParams>;
   pendingUserInputs: Map<string, MspUserInputRequestParams>;
   interruptWaiters: Set<() => void>;
@@ -551,6 +556,13 @@ function handleMuseNotification(
     return;
   }
 
+  if (method === "turn/completed") {
+    const failure = replaceableTurnFailure(params);
+    if (failure !== null) {
+      session.needsReplacement = failure;
+    }
+  }
+
   const deltas = session.translator.onNotification(method, params);
   emitDeltas(session.threadId, deltas);
 
@@ -583,6 +595,34 @@ function handleMuseRequest(
   if (method === "userInput/request") {
     openUserInputInteraction(session, params);
   }
+}
+
+/**
+ * A Muse session cannot replay its own encrypted reasoning once its route
+ * changes, and a route belongs to a `muse serve` process: resume the session on
+ * a second process and the next model call after a tool result fails with
+ * `provider-private history is incompatible with the active route`. The failure
+ * is durable — the offending reasoning item stays in the session — so the
+ * session never recovers, and compaction does not clear it.
+ *
+ * MSP gives this no error kind of its own; it arrives as a turn terminal whose
+ * free text names the condition. Matching that text is the only signal there is,
+ * so it is matched narrowly and used only to decide that the session must be
+ * replaced — never to synthesise a result.
+ */
+export function replaceableTurnFailure(params: unknown): string | null {
+  const parsed = mspTurnCompletedParamsSchema.safeParse(params);
+  if (!parsed.success || parsed.data.terminal !== "failed") {
+    return null;
+  }
+  const message = parsed.data.error?.message ?? parsed.data.reason ?? "";
+  const incompatibleHistory =
+    message.includes("provider-private history is incompatible") ||
+    (message.includes("reasoning replay") &&
+      message.includes("provider attribution"));
+  return incompatibleHistory
+    ? "Muse could not replay this session's reasoning history after its route changed"
+    : null;
 }
 
 function sessionStateDelta(session: MuseSession): ThreadDelta {
@@ -908,6 +948,7 @@ function registerSession(args: {
       args.instructions !== undefined && args.instructions.trim() !== ""
         ? args.instructions
         : null,
+    needsReplacement: null,
     pendingApprovals: new Map(),
     pendingUserInputs: new Map(),
     interruptWaiters: new Set(),
@@ -1569,13 +1610,14 @@ async function submitTurn(args: {
   }
 
   try {
-    await reconcileSessionOptions(session, {
+    const live = await replaceSessionIfNeeded(session);
+    await reconcileSessionOptions(live, {
       model: options.model,
       permissionMode: options.permissionMode,
       permissionScope: options.permissionScope,
       approvalReviewer: options.approvalReviewer,
     });
-    const instructions = session.pendingInstructions;
+    const instructions = live.pendingInstructions;
     const input = withInstructions(
       await turnInputParts(args.input),
       instructions,
@@ -1583,11 +1625,11 @@ async function submitTurn(args: {
     const displayText =
       instructions === null ? undefined : promptDisplayText(args.input);
     const reasoningEffort = reasoningEffortFor(options.reasoningLevel);
-    await session.host.connection.request({
+    await live.host.connection.request({
       method: MSP_METHODS.turnStart,
       params: {
         commandId: uuidV7(),
-        sessionId: session.sessionId,
+        sessionId: live.sessionId,
         input,
         ifBusy: "queue",
         ...(displayText === undefined ? {} : { displayText }),
@@ -1596,8 +1638,13 @@ async function submitTurn(args: {
       resultSchema: mspTurnStartResultSchema,
       timeoutMs: COMMAND_TIMEOUT_MS,
     });
-    session.pendingInstructions = null;
+    live.pendingInstructions = null;
   } catch (error) {
+    /**
+     * Accepted input that never settles leaves bb refusing every later turn on
+     * the thread ("another turn is active or starting"), so every failure on the
+     * submit path — not just a rejected `turn/start` — closes the turn here.
+     */
     const message = error instanceof Error ? error.message : String(error);
     emitDeltas(session.threadId, [
       {
@@ -1615,6 +1662,66 @@ async function submitTurn(args: {
         retryable: true,
       });
     }
+  }
+}
+
+/**
+ * Rebuilds a session Muse can no longer run, keeping the bb thread. The
+ * UltraGoal, findings, and every other durable record live on bb's side, so a
+ * fresh provider session costs the in-session conversation and nothing else —
+ * and `session/replaced` is how the protocol says to report exactly that.
+ */
+async function replaceSessionIfNeeded(
+  session: MuseSession,
+): Promise<MuseSession> {
+  const reason = session.needsReplacement;
+  if (reason === null) {
+    return session;
+  }
+  session.needsReplacement = null;
+
+  try {
+    const result = await session.host.connection.request({
+      method: MSP_METHODS.sessionStart,
+      params: {
+        commandId: uuidV7(),
+        workspaceRoot: session.cwd,
+        approvalMode: session.approvalMode,
+        ...(session.modelId === null ? {} : { modelId: session.modelId }),
+      },
+      resultSchema: mspSessionStartResultSchema,
+      timeoutMs: COMMAND_TIMEOUT_MS,
+    });
+    const replacement = registerSession({
+      threadId: session.threadId,
+      sessionId: result.session.sessionId,
+      host: session.host,
+      cwd: session.cwd,
+      approvalMode: session.approvalMode,
+      modelId: result.session.modelId,
+      sessionLogPath: result.session.path === "" ? null : result.session.path,
+      injectedTools: [...session.injectedTools],
+      ...(session.pendingInstructions === null
+        ? {}
+        : { instructions: session.pendingInstructions }),
+    });
+    notify(BRIDGE_NOTIFICATION_METHODS.sessionReplaced, {
+      threadId: session.threadId,
+      providerThreadId: replacement.sessionId,
+      reason,
+      contextLost: true,
+    });
+    emitDeltas(session.threadId, [
+      {
+        kind: "provider.warning",
+        summary: "Muse started a fresh session for this thread",
+        details: `${reason}. Durable bb state is untouched; the in-session conversation is not.`,
+      },
+    ]);
+    return replacement;
+  } catch {
+    /** A failed replacement leaves the old session to report its own error. */
+    return session;
   }
 }
 

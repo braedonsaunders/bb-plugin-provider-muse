@@ -410,3 +410,33 @@ describe("session instructions", () => {
     expect(withInstructions(parts, "   ")).toEqual(parts);
   });
 });
+
+describe("unrecoverable session history", () => {
+  it("recognises the route-change failure Muse cannot recover from", async () => {
+    process.env.BB_MUSE_EXECUTABLE = "/nonexistent/muse";
+    const { replaceableTurnFailure } = await import(
+      "../src/provider-bridge.js"
+    );
+    const failed = (message: string) => ({
+      sessionId: "s",
+      turnId: "t",
+      terminal: "failed",
+      error: { kind: "modelError", message, retryable: false },
+    });
+    expect(
+      replaceableTurnFailure(
+        failed(
+          "provider-private history is incompatible with the active route: reasoning replay `rs_a:rs_b` has no provider attribution after a provider switch; start a fresh turn without opaque reasoning history",
+        ),
+      ),
+    ).not.toBeNull();
+    expect(replaceableTurnFailure(failed("model overloaded"))).toBeNull();
+    expect(
+      replaceableTurnFailure({
+        sessionId: "s",
+        turnId: "t",
+        terminal: "completed",
+      }),
+    ).toBeNull();
+  });
+});
