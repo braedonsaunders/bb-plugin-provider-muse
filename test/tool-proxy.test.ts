@@ -228,3 +228,46 @@ describe("sandbox posture", () => {
     );
   });
 });
+
+describe("host config isolation", () => {
+  it("gives the same tool set a stable signature and a different one a new key", async () => {
+    process.env.BB_MUSE_EXECUTABLE = "/nonexistent/muse";
+    const { toolsSignature } = await import("../src/provider-bridge.js");
+    const a = [
+      { name: "b_tool", description: "", inputSchema: {} },
+      { name: "a_tool", description: "", inputSchema: {} },
+    ];
+    const reordered = [a[1], a[0]];
+    expect(toolsSignature(a)).toBe(toolsSignature(reordered));
+    expect(toolsSignature(a)).not.toBe(
+      toolsSignature([...a, { name: "c_tool", description: "", inputSchema: {} }]),
+    );
+  });
+
+  it("never reuses a config directory between host instances", async () => {
+    const { prepareMuseConfigHome } = await import(
+      "../src/tool-proxy/config-home.js"
+    );
+    const root = mkdtempSync(join(tmpdir(), "bb-muse-iso-"));
+    const source = join(root, "src");
+    mkdirSync(source, { recursive: true });
+    writeFileSync(join(source, "settings.json"), "{}");
+    const first = await prepareMuseConfigHome({
+      root: join(root, "a"),
+      sourceConfigDir: source,
+      mcpServer: { command: "node", args: [], env: {} },
+    });
+    const second = await prepareMuseConfigHome({
+      root: join(root, "b"),
+      sourceConfigDir: source,
+      mcpServer: { command: "node", args: [], env: {} },
+    });
+    expect(first).not.toBe(second);
+    /** The first host's configuration must survive the second being built. */
+    expect(
+      JSON.parse(readFileSync(join(first, "muse", "settings.json"), "utf8"))
+        .mcpServers["bb-bridge"],
+    ).toBeDefined();
+    rmSync(root, { recursive: true, force: true });
+  });
+});

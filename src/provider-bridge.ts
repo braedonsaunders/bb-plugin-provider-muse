@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -177,6 +178,17 @@ const hosts = new Map<string, MuseHost>();
 const sessions = new Map<string, MuseSession>();
 const sessionsByMuseId = new Map<string, MuseSession>();
 
+let nextConfigHomeSerial = 0;
+
+/**
+ * A fresh directory per host instance: an orphaned Muse process from a previous
+ * bridge can never have its configuration pulled out from under it.
+ */
+function configHomeSerial(): string {
+  nextConfigHomeSerial += 1;
+  return `${process.pid}-${nextConfigHomeSerial}`;
+}
+
 let bridgeDataDir: string | null = null;
 let toolProxy: ToolProxyEndpoint | null = null;
 let toolProxyScriptPath: string | null = null;
@@ -311,6 +323,14 @@ function childEnv(
  * The private config directory this thread's Muse host reads: the user's own
  * settings and credentials, plus the one MCP server that reaches bb's tools.
  */
+/** Stable across bridge restarts, so an unchanged tool set reuses its host. */
+export function toolsSignature(tools: readonly DynamicTool[]): string {
+  return createHash("sha256")
+    .update(JSON.stringify(tools.map((tool) => tool.name).sort()))
+    .digest("hex")
+    .slice(0, 12);
+}
+
 async function buildThreadConfigHome(
   threadId: string,
   tools: readonly DynamicTool[],
@@ -320,7 +340,12 @@ async function buildThreadConfigHome(
     return null;
   }
   return prepareMuseConfigHome({
-    root: join(bridgeDataDir, "threads", threadId.replace(/[^A-Za-z0-9_-]/gu, "_")),
+    root: join(
+      bridgeDataDir,
+      "threads",
+      threadId.replace(/[^A-Za-z0-9_-]/gu, "_"),
+      `${toolsSignature(tools)}-${configHomeSerial()}`,
+    ),
     mcpServer: {
       command: process.execPath,
       args: [toolProxyScriptPath],
@@ -356,18 +381,28 @@ async function ensureHost(args: {
 }): Promise<MuseHost> {
   const tools = args.dynamicTools ?? [];
   const scopedToThread = tools.length > 0 && args.threadId !== undefined;
+  /**
+   * Muse reads its MCP configuration once, at host startup, and disables MCP
+   * for the whole runtime if that audit fails. The config directory therefore
+   * belongs to a host for as long as that host lives: it is keyed by the tools
+   * it was built for, and it is never rewritten under a running process. A
+   * thread whose injected tools change gets a new host rather than an edited
+   * directory.
+   */
   const signature = scopedToThread
-    ? `${postureSignature(args.posture)}|thread:${args.threadId}`
+    ? `${postureSignature(args.posture)}|thread:${args.threadId}|tools:${toolsSignature(tools)}`
     : postureSignature(args.posture);
-  const configHome = scopedToThread
-    ? await buildThreadConfigHome(args.threadId as string, tools)
-    : null;
+
   const existing = hosts.get(signature);
   if (existing !== undefined && !existing.connection.exited) {
     cancelIdleShutdown(existing);
     await existing.ready;
     return existing;
   }
+
+  const configHome = scopedToThread
+    ? await buildThreadConfigHome(args.threadId as string, tools)
+    : null;
 
   const host: MuseHost = {
     signature,

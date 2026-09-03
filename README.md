@@ -101,6 +101,12 @@ the bridge asks bb's runtime to run the tool. Your own
 `~/.config/muse/settings.json` is never written to, and bb's tools never appear
 in your terminal sessions.
 
+Muse reads that configuration once, at host startup, and disables MCP for the
+whole runtime if the audit fails — so a config directory belongs to its host for
+as long as that host lives. It is keyed by the tools it was built for and never
+rewritten underneath a running process; a thread whose injected tools change
+gets a new host instead of an edited directory.
+
 That is what puts `mcp__bb_bridge.*` — thread mentions, decisions, findings, and
 whatever your other plugins register — in front of Muse.
 
