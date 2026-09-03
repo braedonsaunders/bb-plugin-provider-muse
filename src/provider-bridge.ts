@@ -167,6 +167,7 @@ interface MuseSession {
   modelId: string | null;
   sessionLogPath: string | null;
   injectedTools: Set<string>;
+  pendingInstructions: string | null;
   pendingApprovals: Map<string, MspApprovalRequestParams>;
   pendingUserInputs: Map<string, MspUserInputRequestParams>;
   interruptWaiters: Set<() => void>;
@@ -839,6 +840,7 @@ function registerSession(args: {
   modelId: string | null;
   sessionLogPath: string | null;
   injectedTools?: readonly string[];
+  instructions?: string;
 }): MuseSession {
   const previous = sessions.get(args.threadId);
   if (previous !== undefined) {
@@ -855,6 +857,10 @@ function registerSession(args: {
     modelId: args.modelId,
     sessionLogPath: args.sessionLogPath,
     injectedTools: new Set(args.injectedTools ?? []),
+    pendingInstructions:
+      args.instructions !== undefined && args.instructions.trim() !== ""
+        ? args.instructions
+        : null,
     pendingApprovals: new Map(),
     pendingUserInputs: new Map(),
     interruptWaiters: new Set(),
@@ -1118,6 +1124,9 @@ const handlers: Record<string, RequestHandler> = {
       modelId: result.session.modelId,
       sessionLogPath: result.session.path === "" ? null : result.session.path,
       injectedTools: (parsed.data.dynamicTools ?? []).map((tool) => tool.name),
+      ...(options.instructions === undefined
+        ? {}
+        : { instructions: options.instructions }),
     });
     io.sendResult(id, {
       providerThreadId: session.sessionId,
@@ -1184,6 +1193,9 @@ const handlers: Record<string, RequestHandler> = {
       modelId: result.session.modelId,
       sessionLogPath: result.session.path === "" ? null : result.session.path,
       injectedTools: (parsed.data.dynamicTools ?? []).map((tool) => tool.name),
+      ...(options.instructions === undefined
+        ? {}
+        : { instructions: options.instructions }),
     });
     await reconcileSessionOptions(session, {
       model: options.model,
@@ -1241,6 +1253,9 @@ const handlers: Record<string, RequestHandler> = {
       modelId: result.session.modelId,
       sessionLogPath: result.session.path === "" ? null : result.session.path,
       injectedTools: (parsed.data.dynamicTools ?? []).map((tool) => tool.name),
+      ...(options.instructions === undefined
+        ? {}
+        : { instructions: options.instructions }),
     });
     await reconcileSessionOptions(session, {
       model: options.model,
@@ -1449,6 +1464,45 @@ async function interruptSession(
   );
 }
 
+/**
+ * bb states how an agent should behave inside it — that the `bb` CLI exists,
+ * that `bb thread` reads other threads, whatever the user's plugins add — as
+ * session instructions. MSP has no system-prompt slot, so they ride the first
+ * turn the way the Claude bridge delivers them, wrapped so the model reads them
+ * as instructions rather than as something the user typed.
+ *
+ * `displayText` carries the user's own prompt, so the transcript shows what
+ * they wrote and not the instruction block.
+ */
+export function withInstructions(
+  parts: readonly { type: "text" | "image"; [key: string]: unknown }[],
+  instructions: string | null,
+): { type: "text" | "image"; [key: string]: unknown }[] {
+  if (instructions === null || instructions.trim() === "") {
+    return [...parts];
+  }
+  return [
+    {
+      type: "text",
+      text: `<system_instructions>
+${instructions.trim()}
+</system_instructions>`,
+    },
+    ...parts,
+  ];
+}
+
+function promptDisplayText(input: readonly PromptInput[]): string | undefined {
+  const text = input
+    .filter((item): item is Extract<PromptInput, { type: "text" }> =>
+      item.type === "text",
+    )
+    .map((item) => item.text)
+    .join("")
+    .trim();
+  return text === "" ? undefined : text;
+}
+
 async function submitTurn(args: {
   session: MuseSession;
   input: readonly PromptInput[];
@@ -1474,7 +1528,13 @@ async function submitTurn(args: {
       permissionScope: options.permissionScope,
       approvalReviewer: options.approvalReviewer,
     });
-    const input = await turnInputParts(args.input);
+    const instructions = session.pendingInstructions;
+    const input = withInstructions(
+      await turnInputParts(args.input),
+      instructions,
+    );
+    const displayText =
+      instructions === null ? undefined : promptDisplayText(args.input);
     const reasoningEffort = reasoningEffortFor(options.reasoningLevel);
     await session.host.connection.request({
       method: MSP_METHODS.turnStart,
@@ -1483,11 +1543,13 @@ async function submitTurn(args: {
         sessionId: session.sessionId,
         input,
         ifBusy: "queue",
+        ...(displayText === undefined ? {} : { displayText }),
         ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
       },
       resultSchema: mspTurnStartResultSchema,
       timeoutMs: COMMAND_TIMEOUT_MS,
     });
+    session.pendingInstructions = null;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     emitDeltas(session.threadId, [

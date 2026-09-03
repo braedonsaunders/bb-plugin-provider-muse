@@ -34,6 +34,20 @@ it stays warm for a minute after the last thread detaches.
 | subagents | `subagent` items → delegation rows |
 | bb's injected tools | an MCP server the bridge proxies back to bb |
 
+## bb's session instructions
+
+bb tells every agent how to behave inside it — that the `bb` CLI is there, that
+`bb thread` reads another thread, plus whatever the user's own plugins add — as
+`options.instructions` on session construction. MSP has no system-prompt slot,
+so the bridge delivers them on the session's first turn wrapped in
+`<system_instructions>`, the way the Claude bridge does, and sets Muse's
+`displayText` to the user's own prompt so the transcript still shows what they
+typed.
+
+Without this, `Continue from @thread:…` sends Muse hunting through its own
+session store for a bb thread id. With it, the first command it runs is
+`bb thread show`.
+
 ## Permission modes
 
 bb states a permission policy, not a prompt budget. `full` is full access, so

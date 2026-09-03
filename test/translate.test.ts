@@ -385,3 +385,28 @@ describe("permission policy", () => {
     expect(stripMcpPrefix("muse.bash")).toBe("muse.bash");
   });
 });
+
+describe("session instructions", () => {
+  it("delivers bb's instructions ahead of the user's prompt", async () => {
+    process.env.BB_MUSE_EXECUTABLE = "/nonexistent/muse";
+    const { withInstructions } = await import("../src/provider-bridge.js");
+    const parts = withInstructions(
+      [{ type: "text", text: "Continue from @thread:thr_x" }],
+      "You are working inside bb.",
+    );
+    expect(parts).toEqual([
+      {
+        type: "text",
+        text: "<system_instructions>\nYou are working inside bb.\n</system_instructions>",
+      },
+      { type: "text", text: "Continue from @thread:thr_x" },
+    ]);
+  });
+
+  it("leaves the prompt untouched when bb sent no instructions", async () => {
+    const { withInstructions } = await import("../src/provider-bridge.js");
+    const parts = [{ type: "text" as const, text: "hello" }];
+    expect(withInstructions(parts, null)).toEqual(parts);
+    expect(withInstructions(parts, "   ")).toEqual(parts);
+  });
+});
