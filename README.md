@@ -101,6 +101,26 @@ An expired login is not cleared by a new session and a rate limit is not cleared
 by anything but time, so those settle as failures and go to bb — the same split
 codex keeps, which rebuilds for both and reruns neither.
 
+## Every delta names its turn
+
+bb's assembler mints the ids, and it hangs an `item.*Delta` on the turn the
+delta names. A delta that names no turn has nothing to attach to and is dropped
+on the floor — silently, because a bridge that streams nothing is
+indistinguishable from a provider that says nothing until it is done.
+
+`item/delta` is the one MSP notification that carries no `turnId` of its own:
+it is ephemeral-sourced, addressed only by `itemId`. So the turn comes off the
+item the delta appends to, recorded when that item opened. Without it, Muse's
+live command output and its assistant prose both arrive only as the terminal
+snapshot, and a turn that spends forty seconds in a model call and ten in a
+`grep` reads, on screen, as forty-eight seconds of nothing followed by a
+finished answer.
+
+There is no reasoning stream to lose: Muse Spark commits its reasoning
+encrypted, with empty `text` and no summary, so the model's own thinking time
+is dead air the bridge cannot fill. What it can show — every tool row, every
+byte of command output, every token of the reply — now arrives as it happens.
+
 ## Typed failures, so bb's own recovery works
 
 bb core raises `turn.failed` carrying the turn's request id, its attempt number,

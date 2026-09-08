@@ -537,7 +537,18 @@ export class MuseTranslator {
   }
 
   private turnScope(item: MspItem): { providerTurnId?: string } {
-    const turnId = item.turnId ?? null;
+    return this.scopeForTurn(item.turnId ?? null);
+  }
+
+  /**
+   * Every delta bb's assembler keeps has to name the turn it belongs to. An
+   * unscoped `item.*Delta` is discarded outright — the assembler has no open
+   * turn to hang it on — so a stream that arrives without this reads as an
+   * agent that produced nothing until its terminal snapshot lands. `item/delta`
+   * carries no `turnId` of its own, so the turn comes off the item the delta
+   * appends to, which `track` recorded when the item opened.
+   */
+  private scopeForTurn(turnId: string | null): { providerTurnId?: string } {
     return turnId !== null && this.openTurnIds.has(turnId)
       ? { providerTurnId: turnId }
       : {};
@@ -672,6 +683,7 @@ export class MuseTranslator {
       return [];
     }
     const path = field ?? "text";
+    const scope = this.scopeForTurn(tracked.turnId);
 
     if (tracked.stream === "agentMessage") {
       tracked.streamedText = true;
@@ -681,6 +693,7 @@ export class MuseTranslator {
           key: { providerItemId: itemId },
           channel: "agentMessage",
           text: delta,
+          ...scope,
         },
       ];
     }
@@ -697,6 +710,7 @@ export class MuseTranslator {
             key: { providerItemId: itemId, channel: `summary-${summaryIndex}` },
             channel: "reasoningSummary",
             text: delta,
+            ...scope,
           },
         ];
       }
@@ -707,6 +721,7 @@ export class MuseTranslator {
           key: { providerItemId: itemId },
           channel: "reasoningText",
           text: delta,
+          ...scope,
         },
       ];
     }
@@ -719,6 +734,7 @@ export class MuseTranslator {
             key: { providerItemId: itemId },
             channel: "command",
             text: delta,
+            ...scope,
           },
         ];
       }
@@ -729,6 +745,7 @@ export class MuseTranslator {
             key: { providerItemId: itemId },
             channel: "fileChange",
             text: delta,
+            ...scope,
           },
         ];
       }

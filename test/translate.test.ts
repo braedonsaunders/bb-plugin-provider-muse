@@ -175,6 +175,7 @@ describe("streamed text", () => {
         key: { providerItemId: "item-1" },
         channel: "agentMessage",
         text: "hel",
+        providerTurnId: TURN_ID,
       },
     ]);
 
@@ -218,6 +219,7 @@ describe("streamed text", () => {
         key: { providerItemId: "item-1", channel: "summary-1" },
         channel: "reasoningSummary",
         text: "thinking",
+        providerTurnId: TURN_ID,
       },
     ]);
   });
@@ -606,5 +608,82 @@ describe("error classification", () => {
   it("stays quiet when it has nothing to add to the prose", async () => {
     const { museProviderErrorInfo } = await import("../src/error-info.js");
     expect(museProviderErrorInfo({ message: "something went wrong" })).toBeNull();
+  });
+});
+
+/**
+ * The grammar check the unit assertions above cannot make: bb's own assembler
+ * discards an `item.*Delta` that names no turn, so a bridge can emit a
+ * perfectly-shaped delta for every token and still put nothing on screen until
+ * the item's terminal snapshot lands. These run the real assembler.
+ */
+describe("assembled stream", () => {
+  async function assemble(deltas: readonly unknown[]): Promise<string[]> {
+    const { experimental_createDeltaAssembler: createDeltaAssembler } =
+      await import("@get-bb/plugin-sdk/provider-bridge/testing");
+    const assembler = createDeltaAssembler({ providerId: "muse" });
+    return assembler
+      .assemble({
+        threadId: "thr_assembled",
+        deltas: deltas as never,
+      })
+      .map((event) => event.type);
+  }
+
+  it("streams an assistant message as it arrives, not only at its close", async () => {
+    const instance = translator();
+    const deltas: unknown[] = [
+      { kind: "turn.open", providerTurnId: TURN_ID },
+      ...instance.onNotification(
+        "item/started",
+        item({ kind: "agentMessage", text: "" }),
+      ),
+      ...instance.onNotification("item/delta", {
+        sessionId: SESSION_ID,
+        itemId: "item-1",
+        delta: "hel",
+        viewCursor: "cur-3",
+      }),
+      ...instance.onNotification("item/completed", {
+        sessionId: SESSION_ID,
+        viewCursor: "cur-4",
+        item: {
+          itemId: "item-1",
+          kind: "agentMessage",
+          status: "completed",
+          revision: 2,
+          turnId: TURN_ID,
+          text: "hello",
+        },
+      }),
+    ];
+
+    expect(await assemble(deltas)).toContain("item/agentMessage/delta");
+  });
+
+  it("streams a command's output while it is still running", async () => {
+    const instance = translator();
+    const deltas: unknown[] = [
+      { kind: "turn.open", providerTurnId: TURN_ID },
+      ...instance.onNotification(
+        "item/started",
+        item({
+          kind: "toolCall",
+          tool: "muse.bash",
+          args: JSON.stringify({ command: "ls -la" }),
+        }),
+      ),
+      ...instance.onNotification("item/delta", {
+        sessionId: SESSION_ID,
+        itemId: "item-1",
+        field: "output",
+        delta: "total 0\n",
+        viewCursor: "cur-3",
+      }),
+    ];
+
+    expect(await assemble(deltas)).toContain(
+      "item/commandExecution/outputDelta",
+    );
   });
 });
