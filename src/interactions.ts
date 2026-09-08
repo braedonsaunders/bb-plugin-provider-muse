@@ -62,14 +62,39 @@ export function chooseApprovalChoiceId(
   return null;
 }
 
+/**
+ * Muse decomposes a shell command into argv stages and reviews the ones its
+ * grammar cannot resolve — a `${VAR}` expansion, a substitution, a heredoc —
+ * even under `allowAll`. bb asks about the command, not the fragment, so a
+ * decision carries across every remaining stage of the same approval; the
+ * count is stated because the answer covers more than the argv on screen.
+ */
+export function unresolvedApprovalStages(
+  params: MspApprovalRequestParams,
+): number {
+  const stages = params.subject.stages;
+  if (stages === undefined) {
+    return 0;
+  }
+  return stages.filter((stage) => stage.resolution?.kind === "unresolved")
+    .length;
+}
+
 function approvalReason(params: MspApprovalRequestParams): string | null {
+  const reasons: string[] = [];
   if (params.judgeEscalated === true) {
-    return "Muse's approval judge escalated this call for review.";
+    reasons.push("Muse's approval judge escalated this call for review.");
   }
   if (params.protectedWrite === true) {
-    return "This write targets a protected path.";
+    reasons.push("This write targets a protected path.");
   }
-  return null;
+  const unresolved = unresolvedApprovalStages(params);
+  if (unresolved > 1) {
+    reasons.push(
+      `Muse reviews this command in ${String(unresolved)} stages; your answer covers all of them.`,
+    );
+  }
+  return reasons.length === 0 ? null : reasons.join(" ");
 }
 
 export function approvalPayloadFromMsp(

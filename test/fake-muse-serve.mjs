@@ -11,6 +11,56 @@ import { randomUUID } from "node:crypto";
 const sessions = new Map();
 let cursor = 0;
 
+/**
+ * Scripts the one failure a client cannot paper over by waiting: a session whose
+ * opaque reasoning the active route will not accept, which fails every turn it
+ * is asked to run. Seeded with a transcript so the recovery suite can check what
+ * the replacement session was told about the conversation it inherited.
+ */
+const poisonedSessionId = process.env.FAKE_MUSE_POISONED_SESSION ?? null;
+/** Poisons the replacement too, so a rerun that cannot work is scriptable. */
+const poisonEverySession = process.env.FAKE_MUSE_POISON_ALL === "1";
+/** A stored session, named by id, that resumes holding an unanswered approval. */
+const pendingApprovalSessionId =
+  process.env.FAKE_MUSE_PENDING_APPROVAL ?? null;
+if (pendingApprovalSessionId !== null) {
+  sessions.set(pendingApprovalSessionId, { turns: 0, poisoned: false });
+}
+if (poisonedSessionId !== null) {
+  sessions.set(poisonedSessionId, {
+    turns: 0,
+    poisoned: true,
+    items: [
+      {
+        itemId: `${poisonedSessionId}-u1`,
+        kind: "userMessage",
+        status: "completed",
+        revision: 1,
+        text: "why does copy assessment submit a blank hazard assessment?",
+      },
+      {
+        itemId: `${poisonedSessionId}-r1`,
+        kind: "reasoning",
+        status: "completed",
+        revision: 1,
+        text: "opaque reasoning that must never travel",
+      },
+      {
+        itemId: `${poisonedSessionId}-a1`,
+        kind: "agentMessage",
+        status: "completed",
+        revision: 1,
+        text: "copyAssessment posts an empty form on mobile.",
+      },
+    ],
+  });
+}
+
+const INCOMPATIBLE_HISTORY_MESSAGE =
+  "provider-private history is incompatible with the active route: reasoning " +
+  "replay `rs_fake:rs_fake` has no provider attribution after a provider " +
+  "switch; start a fresh turn without opaque reasoning history";
+
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
 }
@@ -29,17 +79,32 @@ function sourceRange(sessionId) {
   };
 }
 
+/** One write for several messages, so a client reads them in one chunk. */
+function sendBurst(messages) {
+  process.stdout.write(
+    `${messages.map((message) => JSON.stringify(message)).join("\n")}\n`,
+  );
+}
+
 function notify(method, params) {
   send({ jsonrpc: "2.0", method, params });
 }
 
+function viewMessage(sessionId, method, params) {
+  return {
+    jsonrpc: "2.0",
+    method,
+    params: {
+      sessionId,
+      viewCursor: nextCursor(),
+      sourceRange: sourceRange(sessionId),
+      ...params,
+    },
+  };
+}
+
 function viewNotify(sessionId, method, params) {
-  notify(method, {
-    sessionId,
-    viewCursor: nextCursor(),
-    sourceRange: sourceRange(sessionId),
-    ...params,
-  });
+  send(viewMessage(sessionId, method, params));
 }
 
 function session(sessionId, extra = {}) {
@@ -60,6 +125,183 @@ function session(sessionId, extra = {}) {
   };
 }
 
+/**
+ * Muse reviews a shell command one argv stage at a time, and only the stages
+ * its grammar cannot resolve come back for a decision. `approval/decide`
+ * settles one stage and reports the *approval* as non-terminal while others
+ * remain, so this host scripts the whole chain: a client that answers once and
+ * stops never sees the turn finish.
+ */
+const APPROVAL_STAGES = Number(process.env.FAKE_MUSE_APPROVAL_STAGES ?? "0");
+/** Drops `approval/updated`, leaving the pending fold as the only way on. */
+const APPROVAL_SILENT = process.env.FAKE_MUSE_APPROVAL_SILENT === "1";
+
+const approvals = new Map();
+
+function approvalChoices() {
+  return [
+    {
+      choiceId: "allow_once",
+      decision: "approved",
+      label: "Allow once",
+      scope: "once",
+    },
+    {
+      choiceId: "allow_session",
+      decision: "approvedForSession",
+      label: "Allow for this session",
+      scope: "session",
+    },
+    { choiceId: "abort", decision: "abort", label: "Reject", scope: "once" },
+  ];
+}
+
+function approvalRequestParams(approval) {
+  return {
+    sessionId: approval.sessionId,
+    approvalId: approval.approvalId,
+    itemId: approval.itemId,
+    turnId: approval.turnId,
+    toolName: "bash",
+    toolCallId: "call_1",
+    currentRequirementId: {
+      approvalId: approval.approvalId,
+      sourceIndex: approval.index,
+    },
+    availableChoices: approvalChoices(),
+    subject: {
+      kind: "shell",
+      command: approval.command,
+      workspaceRoot: "/tmp/fake-muse",
+      stages: approval.stages.map((stage, index) => ({
+        requirementId: { approvalId: approval.approvalId, sourceIndex: index },
+        sourcePosition: index + 1,
+        totalStages: approval.stages.length,
+        argv: [stage],
+        resolution: { kind: index < approval.index ? "approved" : "unresolved" },
+      })),
+    },
+  };
+}
+
+function openApproval(sessionId, turnId, itemId, command, finish, options = {}) {
+  const approvalId = randomUUID();
+  const approval = {
+    approvalId,
+    sessionId,
+    turnId,
+    itemId,
+    command,
+    stages: Array.from({ length: APPROVAL_STAGES }, (_, index) =>
+      index === 0 ? "echo" : `stage-${String(index)}`,
+    ),
+    index: 0,
+    decisions: [],
+    finish,
+  };
+  approvals.set(approvalId, approval);
+  if (options.announce !== false) {
+    viewNotify(sessionId, "approval/requested", approvalRequestParams(approval));
+  }
+}
+
+function decideApproval(id, params) {
+  const approval = approvals.get(params?.approvalId);
+  const reply = (result) => send({ jsonrpc: "2.0", id, result });
+  if (approval === undefined) {
+    send({
+      jsonrpc: "2.0",
+      id,
+      error: {
+        code: -32040,
+        message: "unknown approval",
+        data: { kind: "approvalNotFound" },
+      },
+    });
+    return;
+  }
+  if (params?.requirementId?.sourceIndex !== approval.index) {
+    send({
+      jsonrpc: "2.0",
+      id,
+      error: {
+        code: -32041,
+        message: "requirement is stale",
+        data: { kind: "approvalRequirementStale" },
+      },
+    });
+    return;
+  }
+  approval.decisions.push(params.choiceId);
+  const refused = params.choiceId === "abort";
+  approval.index += 1;
+  const terminal = refused || approval.index >= approval.stages.length;
+  reply({
+    commandId: params.commandId,
+    approvalId: approval.approvalId,
+    status: "accepted",
+    terminal,
+  });
+  if (!terminal) {
+    if (!APPROVAL_SILENT) {
+      viewNotify(
+        approval.sessionId,
+        "approval/updated",
+        approvalRequestParams(approval),
+      );
+    }
+    return;
+  }
+  approvals.delete(approval.approvalId);
+  viewNotify(approval.sessionId, "approval/resolved", {
+    approvalId: approval.approvalId,
+    decision: refused ? "abort" : "approved",
+    resolvedBy: "user",
+  });
+  approval.finish(refused, approval.decisions);
+}
+
+/** The rest of an approved turn: what a client that answered every stage sees. */
+function finishTurn(sessionId, turnId, toolItemId, promptText, refused, decisions) {
+  viewNotify(sessionId, "item/completed", {
+    item: {
+      itemId: toolItemId,
+      kind: "toolCall",
+      status: refused ? "failed" : "completed",
+      revision: 2,
+      turnId,
+      tool: "muse.bash",
+      args: JSON.stringify({ command: "echo hello" }),
+      callId: "call_1",
+      visibleOutput: refused ? "rejected by the user" : "hello\n",
+      exitCode: refused ? 1 : 0,
+    },
+  });
+
+  const messageItemId = `${turnId}-message`;
+  const reply = `muse echo: ${promptText} (${decisions.join(",")})`;
+  viewNotify(sessionId, "item/completed", {
+    item: {
+      itemId: messageItemId,
+      kind: "agentMessage",
+      status: "completed",
+      revision: 1,
+      turnId,
+      text: reply,
+    },
+  });
+  viewNotify(sessionId, "turn/completed", {
+    turnId,
+    terminal: "completed",
+    usage: {
+      inputTokens: 120,
+      outputTokens: 20,
+      cachedTokens: 0,
+      reasoningTokens: 4,
+    },
+  });
+}
+
 function runTurn(sessionId, turnId, promptText) {
   viewNotify(sessionId, "turn/started", { turnId, commandId: turnId });
 
@@ -76,6 +318,18 @@ function runTurn(sessionId, turnId, promptText) {
       callId: "call_1",
     },
   });
+  if (APPROVAL_STAGES > 0) {
+    openApproval(
+      sessionId,
+      turnId,
+      toolItemId,
+      "echo hello; echo ${VAR}; psql -c 'select 1'",
+      (refused, decisions) => {
+        finishTurn(sessionId, turnId, toolItemId, promptText, refused, decisions);
+      },
+    );
+    return;
+  }
   notify("item/delta", {
     sessionId,
     viewCursor: nextCursor(),
@@ -212,7 +466,7 @@ function handle(message) {
 
     case "session/start": {
       const sessionId = params?.sessionId ?? randomUUID();
-      sessions.set(sessionId, { turns: 0 });
+      sessions.set(sessionId, { turns: 0, poisoned: poisonEverySession });
       reply({ session: session(sessionId), viewCursor: nextCursor() });
       return;
     }
@@ -225,10 +479,54 @@ function handle(message) {
         return;
       }
       const sessionId = method === "session/fork" ? randomUUID() : source;
-      sessions.set(sessionId, { turns: 0 });
+      /**
+       * A session whose process died still holds the approval it was waiting
+       * on, and a resumed host announces nothing it has already recorded — so
+       * the pending fold is the only way a client can find it again.
+       */
+      if (
+        method === "session/resume" &&
+        process.env.FAKE_MUSE_PENDING_APPROVAL === source
+      ) {
+        openApproval(
+          sessionId,
+          `${sessionId}-t0`,
+          `${sessionId}-i0`,
+          "psql \"${DB:-postgres}\" -c 'select 1'",
+          () => undefined,
+          { announce: false },
+        );
+      }
+      const inherited = sessions.get(source);
+      sessions.set(sessionId, {
+        turns: 0,
+        poisoned: poisonEverySession || inherited?.poisoned === true,
+        items: inherited?.items ?? [],
+      });
       reply({
         session: session(sessionId),
         history: { mode: "none", items: null, snapshot: null },
+        pendingRequests: [],
+        viewCursor: nextCursor(),
+      });
+      return;
+    }
+
+    case "session/read": {
+      const record = sessions.get(params?.sessionId);
+      if (record === undefined) {
+        fail(-32020, `unknown session ${params?.sessionId}`, {
+          kind: "sessionNotFound",
+        });
+        return;
+      }
+      reply({
+        session: session(params.sessionId),
+        history: {
+          mode: params?.excludeItems === false ? "inline" : "none",
+          items: params?.excludeItems === false ? (record.items ?? []) : null,
+          snapshot: null,
+        },
         pendingRequests: [],
         viewCursor: nextCursor(),
       });
@@ -246,13 +544,50 @@ function handle(message) {
         .filter((part) => part.type === "text")
         .map((part) => part.text)
         .join("");
-      reply({
-        commandId: params.commandId,
-        turnId,
-        disposition: "started",
-        startedNewTurn: true,
-        status: "accepted",
-      });
+      if (sessions.get(sessionId).poisoned !== true) {
+        reply({
+          commandId: params.commandId,
+          turnId,
+          disposition: "started",
+          startedNewTurn: true,
+          status: "accepted",
+        });
+      } else {
+        /**
+         * One write, so the reply and the turn's terminal reach the client in
+         * a single chunk. A real host does this whenever the client is busy
+         * enough to coalesce reads, and it is the ordering that decides whether
+         * a client can still attribute the failure to the prompt that caused
+         * it — so the recovery suite runs against it every time.
+         */
+        sendBurst([
+          {
+            jsonrpc: "2.0",
+            id,
+            result: {
+              commandId: params.commandId,
+              turnId,
+              disposition: "started",
+              startedNewTurn: true,
+              status: "accepted",
+            },
+          },
+          viewMessage(sessionId, "turn/started", {
+            turnId,
+            commandId: turnId,
+          }),
+          viewMessage(sessionId, "turn/completed", {
+            turnId,
+            terminal: "failed",
+            error: {
+              kind: "projectionError",
+              message: INCOMPATIBLE_HISTORY_MESSAGE,
+              retryable: false,
+            },
+          }),
+        ]);
+        return;
+      }
       setTimeout(() => {
         runTurn(sessionId, turnId, promptText);
       }, 1);
@@ -298,11 +633,24 @@ function handle(message) {
       return;
 
     case "approval/decide":
+      if (APPROVAL_STAGES > 0) {
+        decideApproval(id, params);
+        return;
+      }
       reply({
         approvalId: params.approvalId,
         commandId: params.commandId,
         status: "accepted",
         terminal: true,
+      });
+      return;
+
+    case "approval/listPending":
+      reply({
+        approvals: [...approvals.values()]
+          .filter((approval) => approval.sessionId === params?.sessionId)
+          .map((approval) => approvalRequestParams(approval)),
+        userInputs: [],
       });
       return;
 

@@ -1,4 +1,10 @@
-import type { DynamicTool, ThreadDelta } from "@get-bb/plugin-sdk/provider-bridge";
+import type {
+  BridgeExecutionOptions,
+  DynamicTool,
+  PendingInteractionApprovalDecision,
+  PromptInput,
+  ThreadDelta,
+} from "@get-bb/plugin-sdk/provider-bridge";
 import type { MspConnection } from "./msp/connection.js";
 import { MuseTranslator } from "./translate.js";
 import type { MspApprovalRequestParams, MspUserInputRequestParams } from "./msp/schemas.js";
@@ -45,8 +51,37 @@ export interface MuseRuntime {
   openTurnIds: Set<string>;
   turnSettledWaiters: Map<string, Array<() => void>>;
   pendingApprovals: Map<string, MspApprovalRequestParams>;
+  /**
+   * The decision bb already collected for an approval, kept until Muse reports
+   * that approval terminal. An approval spans as many stages as the command has
+   * unresolved argv fragments, and every one of them needs its own
+   * `approval/decide`; re-asking the user per fragment would be bb prompting
+   * about a command it has already been answered on.
+   */
+  approvalDecisions: Map<string, PendingInteractionApprovalDecision>;
+  /** Approvals whose stage chain this bridge is already walking. */
+  approvalsInFlight: Set<string>;
   pendingUserInputs: Map<string, MspUserInputRequestParams>;
   closing: boolean;
+}
+
+/**
+ * The prompt whose turn is on the wire, held until that turn settles.
+ *
+ * Muse fails a turn for conditions bb already knows how to clear — a route its
+ * reasoning history cannot survive, an expired login, a child that died — and a
+ * client that only records the failure has thrown the user's prompt away. What
+ * they type next then lands on the rebuilt session as the prompt, so the answer
+ * they get is to the wrong question. bb owns the rerun instead.
+ */
+export interface InFlightTurn {
+  commandId: string;
+  /** Named by Muse's reply, which the turn's own terminal can arrive before. */
+  providerTurnId: string | null;
+  input: readonly PromptInput[];
+  options: BridgeExecutionOptions;
+  /** A rerun that fails again is a real failure, not another rebuild. */
+  reran: boolean;
 }
 
 export interface MuseAttachment {
@@ -58,6 +93,12 @@ export interface MuseAttachment {
   instructions: string | null;
   /** Delivered on the next turn, then cleared: MSP has no system-prompt slot. */
   pendingInstructions: string | null;
+  /**
+   * Delivered on the next turn, then cleared: the tail of a conversation a
+   * replaced session could not carry, read back out of its own log.
+   */
+  pendingHandoff: string | null;
+  inFlightTurn: InFlightTurn | null;
   providerSessionId: string | null;
   configHome: string | null;
   runtime: MuseRuntime | null;
@@ -102,6 +143,8 @@ export function createRuntime(args: {
     openTurnIds: new Set(),
     turnSettledWaiters: new Map(),
     pendingApprovals: new Map(),
+    approvalDecisions: new Map(),
+    approvalsInFlight: new Set(),
     pendingUserInputs: new Map(),
     closing: false,
   };

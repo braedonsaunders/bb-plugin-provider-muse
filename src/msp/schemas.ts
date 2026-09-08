@@ -11,6 +11,7 @@ export const MSP_METHODS = {
   sessionStart: "session/start",
   sessionResume: "session/resume",
   sessionFork: "session/fork",
+  sessionRead: "session/read",
   sessionCompact: "session/compact",
   sessionSetModel: "session/setModel",
   sessionSetApprovalMode: "session/setApprovalMode",
@@ -20,6 +21,7 @@ export const MSP_METHODS = {
   turnInterrupt: "turn/interrupt",
   viewUnsubscribe: "view/unsubscribe",
   approvalDecide: "approval/decide",
+  approvalListPending: "approval/listPending",
   userInputAnswer: "userInput/answer",
   userInputCancel: "userInput/cancel",
   userInputClarify: "userInput/clarify",
@@ -71,6 +73,42 @@ export const mspSessionStartResultSchema = z
 
 export const mspSessionResumeResultSchema = z
   .object({ session: mspSessionSchema, viewCursor: z.string() })
+  .loose();
+
+/**
+ * `session/read` folds a stored session without loading it, so a replacement
+ * session can be told what the session it replaced had already said. Only the
+ * transcript's speech is read here; the shape stays minimal so a history rung
+ * bb does not use can never fail the parse.
+ */
+const mspHistoryItemSchema = z
+  .object({
+    kind: z.string(),
+    text: z.string().optional(),
+    /** `userMessage`: what bb showed the user, without the wrappers bb added. */
+    displayText: z.string().optional(),
+  })
+  .loose();
+
+export const mspSessionReadResultSchema = z
+  .object({
+    session: mspSessionSchema,
+    history: z
+      .object({
+        mode: z.string(),
+        items: z.array(mspHistoryItemSchema).nullable().optional(),
+        snapshot: z
+          .object({
+            state: z
+              .object({ items: z.array(mspHistoryItemSchema).optional() })
+              .loose(),
+          })
+          .loose()
+          .nullable()
+          .optional(),
+      })
+      .loose(),
+  })
   .loose();
 
 export const mspTurnStartResultSchema = z
@@ -314,6 +352,23 @@ export const mspApprovalRequirementRefSchema = z
   .object({ approvalId: z.string().min(1), sourceIndex: z.number() })
   .loose();
 
+/**
+ * Muse reviews a shell command one argv stage at a time: `grep … | head; psql …`
+ * is eight stages, and only the stages its grammar cannot resolve statically
+ * come back for a decision. The stage list rides on the subject so the prompt
+ * can say how much of the command one answer covers.
+ */
+export const mspApprovalStageSchema = z
+  .object({
+    requirementId: mspApprovalRequirementRefSchema.optional(),
+    sourcePosition: z.number().optional(),
+    totalStages: z.number().optional(),
+    argv: z.array(z.string()).optional(),
+    resolution: z.object({ kind: z.string() }).loose().optional(),
+  })
+  .loose();
+export type MspApprovalStage = z.infer<typeof mspApprovalStageSchema>;
+
 export const mspApprovalRequestParamsSchema = z
   .object({
     sessionId: z.string().min(1),
@@ -339,6 +394,7 @@ export const mspApprovalRequestParamsSchema = z
         access: z.string().optional(),
         toolName: z.string().optional(),
         workspaceRoot: z.string().optional(),
+        stages: z.array(mspApprovalStageSchema).optional(),
       })
       .loose(),
   })
@@ -346,6 +402,34 @@ export const mspApprovalRequestParamsSchema = z
 export type MspApprovalRequestParams = z.infer<
   typeof mspApprovalRequestParamsSchema
 >;
+
+/**
+ * `approval/decide` acknowledges one stage. `terminal` is the whole approval's
+ * state, not the stage's: false means Muse is still holding the tool call and
+ * owes the next requirement. A reply that omits it is read as non-terminal,
+ * because the pending list settles the question either way and a client that
+ * guesses "done" parks the turn forever.
+ */
+export const mspApprovalDecideResultSchema = z
+  .object({
+    commandId: z.string().optional(),
+    approvalId: z.string().optional(),
+    status: z.string().optional(),
+    terminal: z.boolean().nullish(),
+  })
+  .loose();
+
+/**
+ * The pending fold: one full `approval/request` payload per open approval. It
+ * is the authority on which requirement an approval is waiting for, so the
+ * bridge re-reads it rather than trusting a notification to have arrived.
+ */
+export const mspApprovalListPendingResultSchema = z
+  .object({
+    approvals: z.array(z.unknown()).optional(),
+    userInputs: z.array(z.unknown()).optional(),
+  })
+  .loose();
 
 export const mspApprovalResolvedParamsSchema = z
   .object({

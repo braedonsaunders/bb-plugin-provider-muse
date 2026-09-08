@@ -19,6 +19,15 @@ const INCOMPATIBLE_HISTORY_PATTERN =
 export interface TurnFailureClassification {
   /** A rebuild is owed before the next turn. */
   restart: { reason: string; fresh: boolean } | null;
+  /**
+   * Whether bb should rerun the prompt itself once the rebuild is done.
+   *
+   * Only where the rebuild *is* the fix. An expired login is not cleared by a
+   * new session and a rate limit is not cleared by anything but time, so those
+   * settle as failures and are left to the user and to bb's own retry policy —
+   * the same division codex keeps, which restarts for them and reruns neither.
+   */
+  rerun: boolean;
   /** A typed hint bb's runtime acts on. */
   hint: ProviderRecoveryHint | null;
 }
@@ -28,11 +37,11 @@ export function classifyTurnFailure(
 ): TurnFailureClassification {
   const parsed = mspTurnCompletedParamsSchema.safeParse(params);
   if (!parsed.success || parsed.data.terminal !== "failed") {
-    return { restart: null, hint: null };
+    return { restart: null, rerun: false, hint: null };
   }
   const message = parsed.data.error?.message ?? parsed.data.reason ?? "";
   if (message === "") {
-    return { restart: null, hint: null };
+    return { restart: null, rerun: false, hint: null };
   }
 
   /**
@@ -47,6 +56,7 @@ export function classifyTurnFailure(
           "Muse could not replay this session's reasoning history after its route changed, so bb started a fresh session",
         fresh: true,
       },
+      rerun: true,
       hint: null,
     };
   }
@@ -57,6 +67,7 @@ export function classifyTurnFailure(
         reason: "Muse session restarted after an authentication failure",
         fresh: false,
       },
+      rerun: false,
       hint: { kind: "authRequired", message, retryable: false },
     };
   }
@@ -64,9 +75,10 @@ export function classifyTurnFailure(
   if (RATE_LIMIT_PATTERN.test(message)) {
     return {
       restart: null,
+      rerun: false,
       hint: { kind: "rateLimited", message, retryable: false },
     };
   }
 
-  return { restart: null, hint: null };
+  return { restart: null, rerun: false, hint: null };
 }

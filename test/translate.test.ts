@@ -408,6 +408,59 @@ describe("session instructions", () => {
   });
 });
 
+describe("handoff into a replaced session", () => {
+  it("carries what was said and nothing the provider cannot replay", async () => {
+    const { handoffTranscript } = await import("../src/provider-bridge.js");
+    const transcript = handoffTranscript([
+      { kind: "userMessage", text: "why is the copy blank?" },
+      { kind: "reasoning", text: "opaque provider reasoning" },
+      { kind: "toolCall", text: "" },
+      { kind: "agentMessage", text: "copyAssessment posts an empty form." },
+    ]);
+    expect(transcript).toBe(
+      "user: why is the copy blank?\n\nassistant: copyAssessment posts an empty form.",
+    );
+  });
+
+  it("carries the user's own words, not the wrappers bb added", async () => {
+    const { handoffTranscript } = await import("../src/provider-bridge.js");
+    expect(
+      handoffTranscript([
+        {
+          kind: "userMessage",
+          text: "<system_instructions>\nbb rules\n</system_instructions>\nship it",
+        },
+      ]),
+    ).toBe("user: ship it");
+    expect(
+      handoffTranscript([
+        {
+          kind: "userMessage",
+          text: "<system_instructions>\nbb rules\n</system_instructions>\nship it",
+          displayText: "ship it",
+        },
+      ]),
+    ).toBe("user: ship it");
+  });
+
+  it("keeps the end of a conversation too long to carry whole", async () => {
+    const { handoffTranscript } = await import("../src/provider-bridge.js");
+    const transcript = handoffTranscript([
+      { kind: "agentMessage", text: "a".repeat(20_000) },
+      { kind: "userMessage", text: "and then?" },
+    ]);
+    expect(transcript).not.toBeNull();
+    expect(transcript?.length).toBeLessThan(13_000);
+    expect(transcript?.endsWith("user: and then?")).toBe(true);
+  });
+
+  it("has nothing to carry from a session that never spoke", async () => {
+    const { handoffTranscript } = await import("../src/provider-bridge.js");
+    expect(handoffTranscript([])).toBeNull();
+    expect(handoffTranscript([{ kind: "toolCall", text: "" }])).toBeNull();
+  });
+});
+
 describe("turn failure classification", () => {
   const failed = (message: string) => ({
     sessionId: "s",
@@ -424,14 +477,16 @@ describe("turn failure classification", () => {
       ),
     );
     expect(classified.restart).toMatchObject({ fresh: true });
+    expect(classified.rerun).toBe(true);
     expect(classified.hint).toBeNull();
   });
 
   it("types an expired login and a rate limit for bb to act on", async () => {
     const { classifyTurnFailure } = await import("../src/recovery.js");
-    expect(
-      classifyTurnFailure(failed("request failed: 401 unauthorized")).hint,
-    ).toMatchObject({ kind: "authRequired" });
+    const auth = classifyTurnFailure(failed("request failed: 401 unauthorized"));
+    expect(auth.hint).toMatchObject({ kind: "authRequired" });
+    /** A new session does not clear an expired login, so nothing is rerun. */
+    expect(auth.rerun).toBe(false);
     expect(
       classifyTurnFailure(failed("429 rate limit reached for this account"))
         .hint,
@@ -442,10 +497,114 @@ describe("turn failure classification", () => {
     const { classifyTurnFailure } = await import("../src/recovery.js");
     expect(classifyTurnFailure(failed("step limit exceeded"))).toEqual({
       restart: null,
+      rerun: false,
       hint: null,
     });
     expect(
       classifyTurnFailure({ sessionId: "s", turnId: "t", terminal: "completed" }),
-    ).toEqual({ restart: null, hint: null });
+    ).toEqual({ restart: null, rerun: false, hint: null });
+  });
+});
+
+describe("typed provider errors", () => {
+  const failed = (message: string, kind = "modelError") => ({
+    sessionId: SESSION_ID,
+    turnId: TURN_ID,
+    terminal: "failed",
+    viewCursor: "cur-9",
+    sourceRange: {},
+    error: { kind, message, retryable: false },
+  });
+
+  it("reports the failure's category ahead of the boundary that settles it", () => {
+    const instance = translator();
+    const deltas = instance.onNotification(
+      "turn/completed",
+      failed("request failed: 429 rate limit reached for this account"),
+    );
+    expect(deltas).toEqual([
+      {
+        kind: "provider.error",
+        message: "Muse turn failed",
+        detail: "request failed: 429 rate limit reached for this account",
+        settlesTurn: false,
+        willRetry: false,
+        errorInfo: {
+          category: "rate-limit",
+          providerCode: "modelError",
+          httpStatusCode: null,
+        },
+        category: "rate-limit",
+        providerTurnId: TURN_ID,
+      },
+      {
+        kind: "turn.boundary",
+        status: "failed",
+        providerTurnId: TURN_ID,
+        error: {
+          message: "request failed: 429 rate limit reached for this account",
+        },
+      },
+    ]);
+  });
+
+  it("says nothing typed about a turn that did not fail", () => {
+    const instance = translator();
+    const deltas = instance.onNotification("turn/completed", {
+      sessionId: SESSION_ID,
+      turnId: TURN_ID,
+      terminal: "completed",
+      viewCursor: "cur-9",
+      sourceRange: {},
+    });
+    expect(deltas).toEqual([
+      { kind: "turn.boundary", status: "completed", providerTurnId: TURN_ID },
+    ]);
+  });
+});
+
+describe("error classification", () => {
+  it("maps the conditions bb's retry policy acts on", async () => {
+    const { museProviderErrorInfo } = await import("../src/error-info.js");
+    const category = (message: string, kind?: string) =>
+      museProviderErrorInfo(kind === undefined ? { message } : { kind, message })
+        ?.category;
+
+    expect(category("the model provider is overloaded, try again")).toBe(
+      "overloaded",
+    );
+    expect(category("429 too many requests")).toBe("rate-limit");
+    expect(category("401 unauthorized")).toBe("unauthorized");
+    expect(category("payment required: 402")).toBe("billing");
+    expect(category("prompt is too long for this model")).toBe(
+      "context-window-exceeded",
+    );
+    expect(category("connection refused talking to the provider")).toBe(
+      "connection-failed",
+    );
+    expect(category("step budget reached", "stepLimit")).toBe("max-turns");
+    expect(
+      category("provider-private history is incompatible", "projectionError"),
+    ).toBe("internal");
+  });
+
+  it("reads a status code only where the message names one", async () => {
+    const { museProviderErrorInfo } = await import("../src/error-info.js");
+    expect(
+      museProviderErrorInfo({ message: "http status 429 from the provider" })
+        ?.httpStatusCode,
+    ).toBe(429);
+    /** `rs_…503…` is an id fragment, not a status. */
+    expect(
+      museProviderErrorInfo({
+        kind: "projectionError",
+        message: "reasoning replay `rs_503abc` has no provider attribution",
+      })?.httpStatusCode,
+    ).toBeNull();
+  });
+
+  it("stays quiet when it has nothing to add to the prose", async () => {
+    const { museProviderErrorInfo } = await import("../src/error-info.js");
+    expect(museProviderErrorInfo({ message: "something went wrong" })).toBeNull();
   });
 });

@@ -19,6 +19,7 @@ import {
   type ThreadEventTokenUsageBreakdown,
   type ThreadEventTurnStatus,
 } from "@get-bb/plugin-sdk/provider-bridge";
+import { museProviderErrorInfo } from "./error-info.js";
 import {
   mspContextUsageParamsSchema,
   mspItemDeltaParamsSchema,
@@ -435,18 +436,42 @@ export class MuseTranslator {
     const { turnId, terminal, error } = parsed.data;
     const known = this.openTurnIds.delete(turnId);
     const status = turnStatus(terminal);
-    return [
-      {
-        kind: "turn.boundary",
-        status,
-        ...(known ? { providerTurnId: turnId } : { claimIfIdle: true }),
-        ...(error === undefined
-          ? status === "failed" && parsed.data.reason !== undefined
-            ? { error: { message: parsed.data.reason } }
-            : {}
-          : { error: { message: error.message } }),
-      },
-    ];
+    const boundaryMessage =
+      error?.message ??
+      (status === "failed" ? parsed.data.reason : undefined);
+    const message = error?.message ?? parsed.data.reason;
+    const deltas: ThreadDelta[] = [];
+
+    /**
+     * The typed failure, ahead of the boundary that settles the turn. bb's own
+     * recovery reads the category off this delta — a turn that fails with only
+     * a message is a turn nothing downstream can act on.
+     */
+    if (status === "failed" && message !== undefined) {
+      const errorInfo = museProviderErrorInfo({
+        ...(error?.kind === undefined ? {} : { kind: error.kind }),
+        message,
+      });
+      deltas.push({
+        kind: "provider.error",
+        message: "Muse turn failed",
+        detail: message,
+        settlesTurn: false,
+        willRetry: false,
+        ...(errorInfo === null ? {} : { errorInfo, category: errorInfo.category }),
+        ...(known ? { providerTurnId: turnId } : { threadScoped: true }),
+      });
+    }
+
+    deltas.push({
+      kind: "turn.boundary",
+      status,
+      ...(known ? { providerTurnId: turnId } : { claimIfIdle: true }),
+      ...(boundaryMessage === undefined
+        ? {}
+        : { error: { message: boundaryMessage } }),
+    });
+    return deltas;
   }
 
   private onTurnRetryScheduled(params: unknown): ThreadDelta[] {
@@ -455,6 +480,7 @@ export class MuseTranslator {
       return [];
     }
     const { attempt, maxAttempts, reason, retryDelayMs, turnId } = parsed.data;
+    const errorInfo = museProviderErrorInfo({ message: reason });
     return [
       {
         kind: "provider.error",
@@ -462,6 +488,9 @@ export class MuseTranslator {
         detail: `Retrying in ${Math.round(retryDelayMs / 100) / 10}s`,
         willRetry: true,
         settlesTurn: false,
+        ...(errorInfo === null
+          ? {}
+          : { errorInfo, category: errorInfo.category }),
         ...(this.openTurnIds.has(turnId) ? { providerTurnId: turnId } : {}),
       },
     ];

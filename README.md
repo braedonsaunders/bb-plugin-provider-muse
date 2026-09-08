@@ -67,10 +67,62 @@ only on `thread/discard`, on bridge shutdown, or after a long idle.
 
 When a rebuild is unavoidable anyway — the child died, bb restarted the bridge —
 the session is resumed first, because a session that never produced opaque
-reasoning resumes fine. If Muse then refuses the history, the next turn starts a
-fresh session and reports `session/replaced` with `contextLost`: the UltraGoal,
+reasoning resumes fine. If Muse then refuses the history, bb starts a fresh
+session and reports `session/replaced` with `contextLost`: the UltraGoal,
 findings, and every other durable record live on bb's side, so only the
-in-session conversation is lost.
+in-session conversation is at risk.
+
+## The prompt is never the thing that gets dropped
+
+Muse reports a mid-turn failure as the turn's terminal, and the conditions above
+are ones bb already knows how to clear. A bridge that only records such a failure
+has thrown the user's prompt away — and because the rebuild is owed to the *next*
+turn, whatever they type next lands on a brand-new session as the prompt. The
+observed shape of that bug: a turn works for 28 seconds, fails on reasoning
+replay, and the follow-up "?????" gets answered by a fresh session with "I didn't
+catch that."
+
+So the bridge owns the recovery:
+
+- The prompt on the wire is recorded **before** `turn/start` goes out, because
+  the terminal can arrive in the same read as the reply that names the turn.
+- On a classified failure, or on a child that died mid-turn, bb rebuilds the
+  session and resubmits that same prompt, once. A second failure is a real
+  failure — a bridge that kept resubmitting would loop on the user's tokens.
+- A rebuild that loses context re-delivers bb's session instructions, which rode
+  the first turn of the session that was just discarded, and reads the discarded
+  session back with `session/read` to carry a bounded transcript of what was
+  already said into the replacement as `<session_handoff>`. The user's own words
+  come from the view item's `displayText`, so the wrappers bb added do not make
+  a second trip.
+
+The rerun is deliberately narrow: it fires only where the rebuild *is* the fix.
+An expired login is not cleared by a new session and a rate limit is not cleared
+by anything but time, so those settle as failures and go to bb — the same split
+codex keeps, which rebuilds for both and reruns neither.
+
+## Typed failures, so bb's own recovery works
+
+bb core raises `turn.failed` carrying the turn's request id, its attempt number,
+and the bridge's `errorInfo`; the `provider-retry` plugin reads the **category**
+off that and asks core to re-dispatch the original turn on a schedule. Core owns
+the queue and the re-attempt, so a bridge that reports only prose is a bridge
+whose threads silently opt out of all of it.
+
+This bridge therefore emits a typed `provider.error` before the boundary that
+settles a failed turn, and on Muse's own mid-turn retries, and on a bridge-side
+fault. MSP gives a failure an open `kind` and a human message and nothing else,
+so the kind decides what it can — `stepLimit` is `max-turns`, `projectionError`
+and friends are `internal` — and narrow message patterns decide the rest. An
+`httpStatusCode` is reported only where the message names one as a status: a
+three-digit run inside an id is not a status code, and inventing one would put
+words in the provider's mouth.
+
+One gap is Muse's, not bb's: MSP publishes no rate-limit window — there is no
+notification for it and no field on a turn failure — so a rate-limited muse turn
+is reported as `rate-limit` but carries no `provider.rateLimits` state. That is
+enough for the overload backoff, which is purely time-based, and not enough for
+a subscription-window wait, which needs a reset the provider has not told us.
 
 ## Why Muse's OS sandbox defaults to off
 
@@ -127,6 +179,32 @@ Two approvals are never shown, because they are the bridge asking permission to
 be itself: Muse's sandbox gating the loopback connection to the tool proxy this
 plugin started, and Muse gating a tool bb injected — which bb already governs on
 its own side.
+
+## One command, one question
+
+No approval mode covers everything. Muse decomposes a shell command into argv
+stages — `grep … | head; pg_isready; psql "${DB:-…}" -c 'select 1'` is eight —
+and reviews every stage its grammar cannot resolve statically. A `${VAR}`
+expansion, a substitution, or a heredoc is unresolvable by construction, so
+those stages come back for a decision under `allowAll` too. That is Muse being
+careful about the fragment it cannot read, not bb failing to pass on the policy.
+
+What bb must not do is ask eight times. The approval subject is the whole
+command line, which is what you are shown and what you answer, so the decision
+is carried across every remaining stage of the same approval.
+
+The chain is the part that has to be walked to the end. `approval/decide`
+settles one stage, and its `terminal` flag reports the *approval*: while stages
+remain it is false, Muse keeps holding the tool call, and it owes the next
+requirement — over `approval/updated`, or in the `approval/listPending` fold.
+The bridge reads both, because a client that answers the first stage and stops
+leaves the turn parked with nothing on screen but an approval bb has already
+resolved, and a parked turn is indistinguishable from a working one.
+
+Every path out of an approval answers Muse. One it cannot read, cannot render,
+or cannot put to you is refused and reported rather than dropped, and one whose
+decision Muse offers no choice for interrupts the turn — because the failure
+mode this replaces is silence.
 
 ## bb's own tools
 
