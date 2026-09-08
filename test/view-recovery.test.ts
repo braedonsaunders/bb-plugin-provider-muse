@@ -159,3 +159,79 @@ it("settles the turn as a typed failure when the view cannot be read either", as
   );
   expect(error).toBeDefined();
 });
+
+/**
+ * The failure that is worse than hanging.
+ *
+ * A prompt Muse answers without working and a turn running on a session whose
+ * view has stopped look identical from the bridge: no `turn/started` arrives
+ * either way. Settling the second as a completed turn reports success for work
+ * that is still going — seen here as a recovered thread that accepted a message
+ * and closed the turn in the same second, having done nothing.
+ */
+it("does not invent a completed turn while the view is merely quiet", async () => {
+  const deltas = await runTurn();
+
+  const fabricated = deltas.filter(
+    (delta) =>
+      delta.kind === "turn.boundary" &&
+      typeof delta.providerTurnId === "string" &&
+      delta.providerTurnId.startsWith("zero-work"),
+  );
+  expect(fabricated).toEqual([]);
+
+  /** It settles on what the page actually said instead. */
+  const closed = deltas.filter((delta) => delta.kind === "item.close");
+  expect(closed.length).toBeGreaterThan(0);
+});
+
+/**
+ * Muse will hand back a session it can no longer serve a view for — the resume
+ * succeeds and returns an empty view cursor. Carrying a thread on it means
+ * every later turn runs unwatched, so bb declines it.
+ */
+it("refuses to resume a session Muse can no longer show", async () => {
+  /** A session the host knows, so the resume itself succeeds. */
+  const seed = `thr_${randomUUID().slice(0, 8)}`;
+  harness.sendRequest(1, "initialize", {
+    protocolVersion: 1,
+    client: { name: "bb", version: "1" },
+  });
+  await harness.waitForResponse(1);
+  harness.sendRequest(2, "thread/start", {
+    threadId: seed,
+    cwd: workspaceDir,
+    instructionMode: "append",
+    options: OPTIONS,
+  });
+  const seeded = (await harness.waitForResponse(2)) as {
+    result?: { providerThreadId?: string };
+  };
+  const staleSession = seeded.result?.providerThreadId ?? "";
+  expect(staleSession).not.toBe("");
+  harness.takeMessages();
+
+  process.env.FAKE_MUSE_UNVIEWABLE_RESUME = "1";
+  harness.sendRequest(3, "thread/resume", {
+    threadId: `thr_${randomUUID().slice(0, 8)}`,
+    cwd: workspaceDir,
+    providerThreadId: staleSession,
+    instructionMode: "append",
+    options: OPTIONS,
+  });
+  await harness.waitForResponse(3);
+  await harness.flushWork();
+  delete process.env.FAKE_MUSE_UNVIEWABLE_RESUME;
+
+  const deltas = deltasFrom(harness.takeMessages());
+  const warned = deltas.find(
+    (delta) =>
+      delta.kind === "provider.warning" &&
+      String(delta.details).includes("could no longer serve a view"),
+  );
+  expect(warned).toBeDefined();
+
+  /** And bb is now on a session it can watch, not the one it was handed. */
+  const reset = deltas.filter((delta) => delta.kind === "session.reset");
+  expect(reset.length).toBeGreaterThan(0);
+});

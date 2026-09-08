@@ -626,7 +626,14 @@ async function constructRuntime(args: {
       { kind: "session.reset" },
       sessionStateDelta(attachment),
     ]);
-    if (args.request.kind === "resume") {
+    if (session.replacedUnviewable !== null) {
+      await onUnviewableSessionReplaced(
+        attachment,
+        connection,
+        session.replacedUnviewable,
+        session.sessionId,
+      );
+    } else if (args.request.kind === "resume") {
       void reopenPendingInteractions(attachment, runtime);
     }
     return runtime;
@@ -641,6 +648,46 @@ async function constructRuntime(args: {
   }
 }
 
+/**
+ * Reports the one rebuild the caller never asked for: a session bb declined to
+ * resume because Muse could not serve its view. It is a context loss like any
+ * other fresh start, so it is owed the same things — bb's session instructions,
+ * which rode the first turn of the session just abandoned, and a transcript of
+ * what that session had already said.
+ */
+async function onUnviewableSessionReplaced(
+  attachment: MuseAttachment,
+  connection: MspConnection,
+  abandonedSessionId: string,
+  replacementSessionId: string,
+): Promise<void> {
+  const reason =
+    "Muse could no longer serve a view of this session, so bb started a fresh one";
+  attachment.pendingInstructions = attachment.instructions;
+  attachment.pendingHandoff = await readSessionHandoff(
+    connection,
+    abandonedSessionId,
+  );
+  notify(BRIDGE_NOTIFICATION_METHODS.sessionReplaced, {
+    threadId: attachment.threadId,
+    providerThreadId: replacementSessionId,
+    reason,
+    contextLost: true,
+  });
+  emitDeltas(attachment, [
+    {
+      kind: "provider.warning",
+      summary: "Muse started a fresh session for this thread",
+      details:
+        `${reason} — a session bb cannot watch is one whose turns finish ` +
+        "without bb ever hearing about it. Durable bb state is untouched, and " +
+        (attachment.pendingHandoff === null
+          ? "the in-session conversation could not be read back."
+          : "the conversation so far is carried into the new session as a transcript."),
+    },
+  ]);
+}
+
 async function openSession(args: {
   connection: MspConnection;
   construction: SessionConstruction;
@@ -652,6 +699,11 @@ async function openSession(args: {
   path: string;
   /** Where this connection's view starts; "" where Muse offers no head. */
   viewCursor: string;
+  /**
+   * Set to the session id abandoned here: a resume Muse accepted but cannot
+   * serve a view for, replaced by a fresh session on the same connection.
+   */
+  replacedUnviewable: string | null;
 }> {
   const { connection, construction, request } = args;
 
@@ -675,6 +727,7 @@ async function openSession(args: {
       approvalMode: result.session.approvalMode?.mode ?? null,
       path: result.session.path,
       viewCursor: result.viewCursor,
+      replacedUnviewable: null,
     };
   }
 
@@ -691,12 +744,46 @@ async function openSession(args: {
     resultSchema: mspSessionResumeResultSchema,
     timeoutMs: COMMAND_TIMEOUT_MS,
   });
+  /**
+   * A resume Muse accepts but hands no view cursor for is a session whose
+   * materialized projection it can no longer stand behind. It still runs — and
+   * that is the trap: turns execute while no `turn/started` or `turn/completed`
+   * ever reaches bb, so the thread either hangs or, worse, settles on nothing.
+   * bb will not carry a thread on a session it cannot watch, so the resume is
+   * abandoned here for a fresh one and the conversation rides across as a
+   * transcript, the same as any other rebuild.
+   */
+  if (request.kind === "resume" && result.viewCursor === "") {
+    const replacement = await connection.request({
+      method: MSP_METHODS.sessionStart,
+      params: {
+        commandId: uuidV7(),
+        workspaceRoot: construction.cwd,
+        approvalMode: construction.approvalMode,
+        ...(construction.model === undefined
+          ? {}
+          : { modelId: construction.model }),
+      },
+      resultSchema: mspSessionStartResultSchema,
+      timeoutMs: COMMAND_TIMEOUT_MS,
+    });
+    return {
+      sessionId: replacement.session.sessionId,
+      modelId: replacement.session.modelId,
+      approvalMode: replacement.session.approvalMode?.mode ?? null,
+      path: replacement.session.path,
+      viewCursor: replacement.viewCursor,
+      replacedUnviewable: sourceId,
+    };
+  }
+
   return {
     sessionId: result.session.sessionId,
     modelId: result.session.modelId,
     approvalMode: result.session.approvalMode?.mode ?? null,
     path: result.session.path,
     viewCursor: result.viewCursor,
+    replacedUnviewable: null,
   };
 }
 
@@ -2045,6 +2132,35 @@ function scheduleZeroWorkSettlement(args: {
 }): void {
   const { attachment, runtime, clientRequestId } = args;
   const timer = setTimeout(() => {
+    void settleIfNoWork(attachment, runtime, clientRequestId);
+  }, ZERO_WORK_SETTLEMENT_GRACE_MS);
+  timer.unref?.();
+}
+
+/**
+ * "No turn opened" and "no turn was reported" look identical from here, and
+ * they are opposites: the first is a prompt Muse answered without working, the
+ * second is a turn running right now on a session whose view has stopped
+ * reaching bb. Fabricating a completed turn for the second is worse than
+ * hanging — the thread reports success for work that is still going.
+ *
+ * So the view is read before anything is invented. A page settles it: silence
+ * from a session that has nothing to say is empty, and silence from one that
+ * has stopped talking is not.
+ */
+async function settleIfNoWork(
+  attachment: MuseAttachment,
+  runtime: MuseRuntime,
+  clientRequestId: string,
+): Promise<void> {
+  {
+    const live = liveRuntime(attachment.threadId, runtime.serial);
+    if (live === null || live.openTurnIds.size > 0) {
+      return;
+    }
+    await reconcileView({ attachment, runtime });
+  }
+  {
     const live = liveRuntime(attachment.threadId, runtime.serial);
     if (live === null || live.openTurnIds.size > 0) {
       return;
@@ -2056,8 +2172,7 @@ function scheduleZeroWorkSettlement(args: {
       { kind: "input.accepted", clientRequestId, providerTurnId },
       { kind: "turn.boundary", providerTurnId, status: "completed" },
     ]);
-  }, ZERO_WORK_SETTLEMENT_GRACE_MS);
-  timer.unref?.();
+  }
 }
 
 async function submitTurn(args: {

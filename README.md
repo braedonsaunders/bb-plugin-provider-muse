@@ -189,6 +189,22 @@ resolved is not put back in front of you, and `item/delta` is never replayed by
 `view/page`, so a recovered message arrives as one block rather than as it was
 typed.
 
+Two corollaries, both of which bit here before they were handled.
+
+**bb will not resume a session Muse cannot show.** A resume of a session whose
+projection has gone succeeds — and returns an empty `viewCursor`. Carry the
+thread on it and every later turn runs unwatched: it executes, and no
+`turn/started` or `turn/completed` ever comes back. So an empty cursor is read
+as the refusal it is, the resume is abandoned for a fresh session, and the
+conversation rides across as a transcript like any other rebuild.
+
+**A quiet view is not a prompt that needed no work.** A turn that opens nothing
+is how Muse answers a prompt it handles without working, and it is also exactly
+what a turn running behind a dead view looks like. Settling the second as
+completed is worse than hanging: the thread reports success for work that is
+still going. So the view is paged before anything is fabricated — a session with
+nothing to say returns an empty page, and one that has stopped talking does not.
+
 ## Every delta names its turn
 
 bb's assembler mints the ids, and it hangs an `item.*Delta` on the turn the

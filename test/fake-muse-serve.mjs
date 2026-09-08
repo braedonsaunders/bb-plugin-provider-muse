@@ -539,7 +539,16 @@ function handle(message) {
     case "session/resume":
     case "session/fork": {
       const source = params?.sessionId;
-      if (method === "session/resume" && !sessions.has(source)) {
+      /**
+       * Each thread gets its own host process, so a session another host
+       * opened is unknown here. The unviewable-resume case is about the cursor
+       * Muse hands back, not about where the session lives.
+       */
+      if (
+        method === "session/resume" &&
+        !sessions.has(source) &&
+        process.env.FAKE_MUSE_UNVIEWABLE_RESUME !== "1"
+      ) {
         fail(-32031, `unknown session ${source}`, { kind: "sessionNotFound" });
         return;
       }
@@ -568,11 +577,18 @@ function handle(message) {
         poisoned: poisonEverySession || inherited?.poisoned === true,
         items: inherited?.items ?? [],
       });
+      /**
+       * A session Muse accepts back but hands no view cursor for: it still
+       * runs, but nothing it does will ever be reported.
+       */
+      const unviewable =
+        method === "session/resume" &&
+        process.env.FAKE_MUSE_UNVIEWABLE_RESUME === "1";
       reply({
         session: session(sessionId),
         history: { mode: "none", items: null, snapshot: null },
         pendingRequests: [],
-        viewCursor: nextCursor(),
+        viewCursor: unviewable ? "" : nextCursor(),
       });
       return;
     }
