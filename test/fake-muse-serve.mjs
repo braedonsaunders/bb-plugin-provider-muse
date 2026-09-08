@@ -507,6 +507,15 @@ function handle(message) {
         });
         return;
       }
+      /**
+       * The refusal that is bb's fault, not the session's: an anchor from
+       * another session's cursor space. Muse is fine; the read was wrong.
+       */
+      const badAnchor = process.env.FAKE_MUSE_VIEW_BAD_ANCHOR;
+      if (badAnchor === "all" || (badAnchor === "1" && params?.cursor)) {
+        fail(-32041, "unknown cursor anchor", { kind: "invalidParams" });
+        return;
+      }
       if (typeof params?.limit !== "number") {
         fail(-32602, "invalid view/page params: missing field `limit`", {
           kind: "invalidParams",

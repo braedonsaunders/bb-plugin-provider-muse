@@ -81,6 +81,8 @@ export interface MuseRuntime {
   reconciling: boolean;
   /** A dropped stream is worth saying once per runtime, not once per recovery. */
   reportedViewGap: boolean;
+  /** Likewise a read bb could not make; the turn keeps running either way. */
+  reportedViewReadFailure: boolean;
   closing: boolean;
 }
 
@@ -170,6 +172,7 @@ export function createRuntime(args: {
     reconcileTimer: null,
     reconciling: false,
     reportedViewGap: false,
+    reportedViewReadFailure: false,
     closing: false,
   };
 }

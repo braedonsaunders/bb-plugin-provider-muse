@@ -47,6 +47,7 @@ beforeEach(() => {
 afterEach(() => {
   harness.restore();
   delete process.env.FAKE_MUSE_VIEW_UNREADABLE;
+  delete process.env.FAKE_MUSE_VIEW_BAD_ANCHOR;
   rmSync(workspaceDir, { recursive: true, force: true });
 });
 
@@ -234,4 +235,50 @@ it("refuses to resume a session Muse can no longer show", async () => {
   /** And bb is now on a session it can watch, not the one it was handed. */
   const reset = deltas.filter((delta) => delta.kind === "session.reset");
   expect(reset.length).toBeGreaterThan(0);
+});
+
+/**
+ * The regression that cost real work.
+ *
+ * A turn is the user's work in flight. Muse names exactly one condition as
+ * unrecoverable by paging; every other way a page can fail — a rejected anchor,
+ * a timeout — is bb failing to read, not Muse failing to run. Settling on those
+ * trades a thread that looks stuck for one that reports a failure over work
+ * still running, which is the worse of the two.
+ *
+ * Observed: a `git log` took four minutes, the watchdog paged from a cursor
+ * minted by a session bb had abandoned, Muse refused the anchor, and the bridge
+ * killed a healthy turn.
+ */
+it("re-reads from the start when an anchor is refused, and still recovers", async () => {
+  process.env.FAKE_MUSE_VIEW_BAD_ANCHOR = "1";
+  const deltas = await runTurn();
+  delete process.env.FAKE_MUSE_VIEW_BAD_ANCHOR;
+
+  /** The whole view is always a valid ask, so the turn still settles for real. */
+  expect(deltas.find((delta) => delta.kind === "turn.boundary")).toMatchObject({
+    status: "completed",
+  });
+  expect(
+    deltas.filter((delta) => delta.kind === "provider.error"),
+  ).toEqual([]);
+});
+
+it("leaves the turn running when no page can be read at all", async () => {
+  process.env.FAKE_MUSE_VIEW_BAD_ANCHOR = "all";
+  const deltas = await runTurn(3_000);
+  delete process.env.FAKE_MUSE_VIEW_BAD_ANCHOR;
+
+  const failed = deltas.filter(
+    (delta) => delta.kind === "turn.boundary" && delta.status === "failed",
+  );
+  expect(failed).toEqual([]);
+
+  /** It says so once, and says the turn is still Muse's to finish. */
+  const warned = deltas.filter(
+    (delta) =>
+      delta.kind === "provider.warning" &&
+      String(delta.summary).includes("could not read Muse's view"),
+  );
+  expect(warned).toHaveLength(1);
 });

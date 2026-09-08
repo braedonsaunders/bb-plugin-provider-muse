@@ -767,6 +767,22 @@ async function openSession(args: {
       resultSchema: mspSessionStartResultSchema,
       timeoutMs: COMMAND_TIMEOUT_MS,
     });
+    /**
+     * `session/resume` auto-subscribes this connection, so the session bb just
+     * declined would go on pushing here — in its own cursor space, which is not
+     * a space the replacement can be paged from. Left subscribed, that is a
+     * turn settled on an anchor Muse rightly refuses.
+     */
+    try {
+      await connection.request({
+        method: MSP_METHODS.viewUnsubscribe,
+        params: { sessionId: sourceId },
+        resultSchema: mspEmptyResultSchema,
+        timeoutMs: COMMAND_TIMEOUT_MS,
+      });
+    } catch {
+      /** The session guard on every cursor is what actually has to hold. */
+    }
     return {
       sessionId: replacement.session.sessionId,
       modelId: replacement.session.modelId,
@@ -848,7 +864,21 @@ function attachmentForParams(params: unknown): MuseAttachment | null {
  */
 function noteViewActivity(runtime: MuseRuntime, params: unknown): void {
   runtime.lastViewActivityAt = Date.now();
-  const cursor = (params as { viewCursor?: unknown } | null)?.viewCursor;
+  const record = params as
+    | { viewCursor?: unknown; sessionId?: unknown }
+    | null;
+  /**
+   * A view cursor belongs to one session's cursor space and means nothing in
+   * another's. A connection can be subscribed to more than one — resuming a
+   * session subscribes to it, so a session abandoned during construction goes
+   * on pushing here — and paging session B from a cursor minted by session A is
+   * refused as an unknown anchor. Which, before this check, is how a healthy
+   * turn got settled as a failure.
+   */
+  if (record?.sessionId !== runtime.sessionId) {
+    return;
+  }
+  const cursor = record.viewCursor;
   if (typeof cursor === "string" && cursor !== "") {
     runtime.lastViewCursor = cursor;
   }
@@ -973,6 +1003,21 @@ async function reconcileView(args: {
       reportViewGapOnce(attachment, runtime);
     }
   } catch (error) {
+    /**
+     * One retry from the beginning of the view before anything is concluded.
+     * A rejected anchor says nothing about the session — only that bb asked
+     * from the wrong place — and the whole view is always a valid ask.
+     */
+    if (args.from === undefined && cursor !== "") {
+      try {
+        runtime.lastViewCursor = null;
+        runtime.reconciling = false;
+        await reconcileView({ attachment, runtime, from: "" });
+        return;
+      } catch {
+        /** Falls through to the report below. */
+      }
+    }
     onReconcileFailed(attachment, runtime, error);
   } finally {
     runtime.reconciling = false;
@@ -998,12 +1043,17 @@ function reportViewGapOnce(
 }
 
 /**
- * A page that cannot be served is the end of the road for this session's view:
- * Muse declares `projectionUnavailable` as unrecoverable by paging, and a
- * truncated or pruned view cannot be walked forward either. The turn is settled
- * rather than left open, and the session is owed a rebuild — which is the same
- * recovery a dead child gets, and the conversation rides across it.
+ * Muse declares exactly one condition as unrecoverable by paging, and only that
+ * one may end a turn bb cannot see.
+ *
+ * Everything else a failed page can mean — a rejected anchor, a timeout, a
+ * transport hiccup — is bb failing to read, not Muse failing to run. A turn is
+ * the user's work in flight, and killing it on a read error trades a thread
+ * that looks stuck for one that reports a failure over work still running.
+ * That is the worse trade, and it is the one this made before the check.
  */
+const VIEW_FATAL_KINDS = new Set(["projectionUnavailable"]);
+
 function onReconcileFailed(
   attachment: MuseAttachment,
   runtime: MuseRuntime,
@@ -1016,7 +1066,28 @@ function onReconcileFailed(
     return;
   }
   const detail = error instanceof Error ? error.message : String(error);
-  const message = `Muse stopped reporting this session and bb could not read it back: ${detail}`;
+  const fatal =
+    error instanceof MspRequestError && VIEW_FATAL_KINDS.has(error.kind ?? "");
+
+  if (!fatal) {
+    /** Said once per runtime: a read bb could not make is not news each time. */
+    if (!runtime.reportedViewReadFailure) {
+      runtime.reportedViewReadFailure = true;
+      emitDeltas(attachment, [
+        {
+          kind: "provider.warning",
+          summary: "bb could not read Muse's view of this session",
+          details:
+            `${detail}. The turn is still Muse's to finish — bb has left it ` +
+            "running and will keep trying to read it back. Stop the thread if " +
+            "it never reports.",
+        },
+      ]);
+    }
+    return;
+  }
+
+  const message = `Muse can no longer serve a view of this session: ${detail}`;
   emitDeltas(attachment, [
     {
       kind: "provider.error",
