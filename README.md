@@ -6,6 +6,14 @@ Threads on this provider get the same surfaces as a bundled one: streamed
 timeline, tool rows, approvals, model picker, health, installation, and a
 subscription usage meter.
 
+## Default posture
+
+By default this provider starts Muse with its OS sandbox **disabled**
+(`--disable-sandbox`) and with **network access enabled**
+(`--sandbox-network enabled`). That is this plugin's default, not Muse's own.
+Both are settings on the plugin; full-access permission mode also disables
+Muse's OS sandbox.
+
 ## How it works
 
 Muse ships an in-process protocol of its own: `muse serve` hosts sessions over
@@ -212,8 +220,10 @@ Muse takes extra tools through MCP and `muse serve` has no per-session tool
 channel, so the bridge gives each thread that carries injected tools a Muse host
 of its own with a private config directory: the user's own settings and
 credentials, plus one added MCP server. Muse spawns that server, the server
-proxies every call back to the bridge over a token-guarded loopback socket, and
-the bridge asks bb's runtime to run the tool. Your own
+proxies every call back to the bridge over a loopback socket guarded by a
+per-thread token bound to that thread's allowed tools, and the bridge asks bb's
+runtime to run the tool. A call that presents another thread's id or a tool
+that thread was not attached with is refused. Your own
 `~/.config/muse/settings.json` is never written to, and bb's tools never appear
 in your terminal sessions.
 

@@ -97,8 +97,10 @@ import {
 import { prepareMuseConfigHome } from "./tool-proxy/config-home.js";
 import {
   startToolProxyEndpoint,
+  type ToolProxyCall,
   type ToolProxyEndpoint,
 } from "./tool-proxy/endpoint.js";
+import { stripMcpPrefix, toolIsDeclared } from "./tool-proxy/names.js";
 import { MUSE_TOOL_PROXY_SCRIPT } from "./tool-proxy/script.js";
 import {
   MUSE_DEFAULT_REASONING_LEVEL,
@@ -108,6 +110,8 @@ import {
   museProviderOptionsSchema,
   type MuseProviderOptions,
 } from "./vocabulary.js";
+
+export { stripMcpPrefix };
 
 const CLIENT_NAME = "bb";
 const CLIENT_VERSION = "1";
@@ -362,17 +366,29 @@ async function ensureToolProxy(): Promise<ToolProxyEndpoint | null> {
   return toolProxy;
 }
 
-async function runInjectedTool(call: {
-  threadId: string;
-  tool: string;
-  callId: string;
-  arguments: Record<string, unknown>;
-}) {
+export async function runInjectedTool(call: ToolProxyCall) {
+  const binding = toolProxy?.bindingFor(call.token) ?? null;
+  if (
+    binding === null ||
+    binding.threadId !== call.threadId ||
+    !toolIsDeclared(call.tool, binding.allowedTools)
+  ) {
+    return {
+      ok: false as const,
+      error: "rejected tool proxy request",
+    };
+  }
   const attachment = attachments.get(call.threadId);
   if (attachment === undefined || attachment.providerSessionId === null) {
     return {
       ok: false as const,
       error: `bb has no live session for thread ${call.threadId}`,
+    };
+  }
+  if (!toolIsDeclared(call.tool, attachment.construction.toolNames)) {
+    return {
+      ok: false as const,
+      error: "rejected tool proxy request",
     };
   }
   const result = await sendRuntimeRequest(
@@ -405,12 +421,17 @@ async function buildConfigHome(
   tools: readonly DynamicTool[],
 ): Promise<string | null> {
   if (tools.length === 0) {
+    toolProxy?.revokeThread(threadId);
     return null;
   }
   const proxy = await ensureToolProxy();
   if (proxy === null || bridgeDataDir === null || toolProxyScriptPath === null) {
     return null;
   }
+  const token = proxy.issueToken({
+    threadId,
+    allowedTools: tools.map((tool) => tool.name),
+  });
   return prepareMuseConfigHome({
     root: join(
       bridgeDataDir,
@@ -425,7 +446,7 @@ async function buildConfigHome(
         /** bb ships as Electron, whose binary needs this to behave as node. */
         ELECTRON_RUN_AS_NODE: "1",
         BB_MUSE_TOOL_PORT: String(proxy.port),
-        BB_MUSE_TOOL_TOKEN: proxy.token,
+        BB_MUSE_TOOL_TOKEN: token,
         BB_MUSE_TOOL_THREAD_ID: threadId,
         BB_MUSE_TOOLS: JSON.stringify(
           tools.map((tool) => ({
@@ -650,6 +671,7 @@ function forgetAttachment(attachment: MuseAttachment): void {
   attachment.closing = true;
   cancelIdleShutdown(attachment);
   releaseRuntime(attachment, { kill: true });
+  toolProxy?.revokeThread(attachment.threadId);
   attachments.delete(attachment.threadId);
   if (attachment.providerSessionId !== null) {
     attachmentsBySessionId.delete(attachment.providerSessionId);
@@ -909,19 +931,6 @@ function handleChildExit(
   if (interrupted !== null && !interrupted.reran && !attachment.closing) {
     void rerunFailedTurn(attachment, interrupted, reason);
   }
-}
-
-/**
- * Muse namespaces an MCP tool as `mcp__<server>__<tool>` (and shows it dotted),
- * so a name is matched back to the tool bb declared.
- */
-export function stripMcpPrefix(tool: string): string {
-  const match = /^mcp__[^_]+(?:_[^_]+)*?__(?<name>.+)$/u.exec(tool);
-  if (match?.groups?.name !== undefined) {
-    return match.groups.name;
-  }
-  const dotted = /^mcp__[A-Za-z0-9_]+\.(?<name>.+)$/u.exec(tool);
-  return dotted?.groups?.name ?? tool;
 }
 
 /**

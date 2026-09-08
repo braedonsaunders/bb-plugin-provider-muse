@@ -25,9 +25,10 @@ everything. bb asks about the command, not the fragment: one answer settles
 every stage of it.
 
 Injected tools reach Muse through an MCP server the bridge starts for that
-thread, configured in a private directory. Your own Muse settings and
-credentials are read, never written, and bb's tools never appear in your
-terminal sessions.
+thread, configured in a private directory. Each thread receives its own
+loopback token, valid only for that thread and the tools bb attached to it.
+Your own Muse settings and credentials are read, never written, and bb's tools
+never appear in your terminal sessions.
 
 When Muse fails a turn for something a new session clears, bb rebuilds the
 session and runs your prompt again once, carrying a transcript of the
@@ -37,6 +38,13 @@ instead, because neither is fixed by a rebuild.
 Meta publishes no usage endpoint, so the subscription meter is measured from
 Muse's own session logs over a five-hour rolling window.
 
+## Default posture
+
+By default this provider starts Muse with its OS sandbox disabled
+(`--disable-sandbox`) and with network access enabled
+(`--sandbox-network enabled`). Both are plugin settings you can change.
+Full-access permission mode also disables Muse's OS sandbox.
+
 ## Requirements
 
 The Muse Code CLI must be installed on the machine that runs the thread, and
@@ -45,9 +53,9 @@ and can run the install for you. A Meta account with Muse Code access is
 required; the rate limits are Meta's.
 
 Muse's own OS sandbox is left off by default, because builds and test runs do
-not survive it. Turned on, the shell runs with network access enabled rather
-than Muse's proxy-only default, which cuts the bb CLI's larger responses. Both
-are settings on the plugin.
+not survive it. With the sandbox turned on, the shell still runs with network
+access enabled rather than Muse's proxy-only default, which cuts the bb CLI's
+larger responses. Both remain settings on the plugin.
 
 ## Links
 

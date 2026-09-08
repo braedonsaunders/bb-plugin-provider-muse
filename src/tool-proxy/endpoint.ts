@@ -1,15 +1,17 @@
 import { randomBytes } from "node:crypto";
 import { createServer, type Server, type Socket } from "node:net";
 import { z } from "zod";
+import { toolIsDeclared } from "./names.js";
 
 /**
  * The bridge half of the tool proxy: a loopback socket the MCP servers Muse
  * spawns call back into. Muse never talks to bb directly — it calls a tool, the
  * proxy forwards the call here, and the bridge asks the runtime to run it.
  *
- * The listener binds 127.0.0.1 on an ephemeral port and every request carries a
- * per-process token plus the thread it belongs to, so one bridge process can
- * serve several threads without a call landing on the wrong one.
+ * The listener binds 127.0.0.1 on an ephemeral port. Each thread that carries
+ * injected tools receives its own server-side token, minted for that thread
+ * and the tool names it was attached with. A request whose token, thread id,
+ * or tool does not match that binding is refused before the call is forwarded.
  */
 
 const bridgeRequestSchema = z
@@ -28,6 +30,7 @@ export interface ToolProxyCall {
   tool: string;
   callId: string;
   arguments: Record<string, unknown>;
+  token: string;
 }
 
 export interface ToolProxyResult {
@@ -41,17 +44,68 @@ export interface ToolProxyFailure {
   error: string;
 }
 
+export interface ToolProxyTokenBinding {
+  threadId: string;
+  allowedTools: ReadonlySet<string>;
+}
+
 export interface ToolProxyEndpoint {
   port: number;
-  token: string;
+  issueToken(args: {
+    threadId: string;
+    allowedTools: readonly string[];
+  }): string;
+  revokeThread(threadId: string): void;
+  bindingFor(token: string): ToolProxyTokenBinding | null;
   close(): void;
 }
+
+const REJECTED = { ok: false, error: "rejected tool proxy request" } as const;
 
 export async function startToolProxyEndpoint(args: {
   onCall(call: ToolProxyCall): Promise<ToolProxyResult | ToolProxyFailure>;
   onError?(error: unknown): void;
 }): Promise<ToolProxyEndpoint> {
-  const token = randomBytes(24).toString("hex");
+  const tokens = new Map<string, { threadId: string; allowedTools: Set<string> }>();
+
+  function bindingFor(token: string): ToolProxyTokenBinding | null {
+    const binding = tokens.get(token);
+    return binding === undefined ? null : binding;
+  }
+
+  function revokeThread(threadId: string): void {
+    for (const [token, binding] of tokens) {
+      if (binding.threadId === threadId) {
+        tokens.delete(token);
+      }
+    }
+  }
+
+  function issueToken(issue: {
+    threadId: string;
+    allowedTools: readonly string[];
+  }): string {
+    revokeThread(issue.threadId);
+    const token = randomBytes(24).toString("hex");
+    tokens.set(token, {
+      threadId: issue.threadId,
+      allowedTools: new Set(issue.allowedTools),
+    });
+    return token;
+  }
+
+  function authorized(
+    token: string,
+    threadId: string,
+    tool: string,
+  ): boolean {
+    const binding = tokens.get(token);
+    return (
+      binding !== undefined &&
+      binding.threadId === threadId &&
+      toolIsDeclared(tool, binding.allowedTools)
+    );
+  }
 
   const server: Server = createServer((socket: Socket) => {
     socket.setEncoding("utf8");
@@ -65,10 +119,11 @@ export async function startToolProxyEndpoint(args: {
       const line = buffer.slice(0, newline);
       buffer = "";
       const parsed = bridgeRequestSchema.safeParse(safeJson(line));
-      if (!parsed.success || parsed.data.token !== token) {
-        socket.end(
-          `${JSON.stringify({ ok: false, error: "rejected tool proxy request" })}\n`,
-        );
+      if (
+        !parsed.success ||
+        !authorized(parsed.data.token, parsed.data.threadId, parsed.data.tool)
+      ) {
+        socket.end(`${JSON.stringify(REJECTED)}\n`);
         return;
       }
       args
@@ -77,6 +132,7 @@ export async function startToolProxyEndpoint(args: {
           tool: parsed.data.tool,
           callId: parsed.data.callId,
           arguments: parsed.data.arguments,
+          token: parsed.data.token,
         })
         .then((result) => {
           socket.end(`${JSON.stringify(result)}\n`);
@@ -113,8 +169,11 @@ export async function startToolProxyEndpoint(args: {
 
   return {
     port: address.port,
-    token,
+    issueToken,
+    revokeThread,
+    bindingFor,
     close: () => {
+      tokens.clear();
       server.close();
     },
   };

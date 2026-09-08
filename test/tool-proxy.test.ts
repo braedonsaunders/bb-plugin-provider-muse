@@ -134,9 +134,13 @@ describe("tool proxy endpoint", () => {
       },
     });
     try {
+      const token = endpoint.issueToken({
+        threadId: "thr_1",
+        allowedTools: ["bb_probe"],
+      });
       const result = await request(endpoint.port, {
         threadId: "thr_1",
-        token: endpoint.token,
+        token,
         kind: "toolCall",
         tool: "bb_probe",
         callId: "call-1",
@@ -161,6 +165,7 @@ describe("tool proxy endpoint", () => {
       },
     });
     try {
+      endpoint.issueToken({ threadId: "thr_1", allowedTools: ["bb_probe"] });
       const result = (await request(endpoint.port, {
         threadId: "thr_1",
         token: "wrong",
@@ -176,6 +181,122 @@ describe("tool proxy endpoint", () => {
     }
   });
 
+  it("issues a distinct token per thread and rejects a swapped thread id", async () => {
+    let called = false;
+    const endpoint = await startToolProxyEndpoint({
+      onCall: async () => {
+        called = true;
+        return { ok: true, content: [] };
+      },
+    });
+    try {
+      const tokenA = endpoint.issueToken({
+        threadId: "thr_a",
+        allowedTools: ["bb_probe"],
+      });
+      const tokenB = endpoint.issueToken({
+        threadId: "thr_b",
+        allowedTools: ["bb_probe"],
+      });
+      expect(tokenA).not.toBe(tokenB);
+      expect(endpoint.bindingFor(tokenA)?.threadId).toBe("thr_a");
+      expect(endpoint.bindingFor(tokenB)?.threadId).toBe("thr_b");
+
+      const swapped = (await request(endpoint.port, {
+        threadId: "thr_b",
+        token: tokenA,
+        kind: "toolCall",
+        tool: "bb_probe",
+        callId: "call-1",
+        arguments: {},
+      })) as { ok: boolean; error?: string };
+      expect(swapped).toEqual({
+        ok: false,
+        error: "rejected tool proxy request",
+      });
+      expect(called).toBe(false);
+    } finally {
+      endpoint.close();
+    }
+  });
+
+  it("rejects a tool the token was not issued for", async () => {
+    let called = false;
+    const endpoint = await startToolProxyEndpoint({
+      onCall: async () => {
+        called = true;
+        return { ok: true, content: [] };
+      },
+    });
+    try {
+      const token = endpoint.issueToken({
+        threadId: "thr_1",
+        allowedTools: ["bb_probe"],
+      });
+      const result = (await request(endpoint.port, {
+        threadId: "thr_1",
+        token,
+        kind: "toolCall",
+        tool: "bb_secret_store",
+        callId: "call-1",
+        arguments: {},
+      })) as { ok: boolean; error?: string };
+      expect(result).toEqual({
+        ok: false,
+        error: "rejected tool proxy request",
+      });
+      expect(called).toBe(false);
+    } finally {
+      endpoint.close();
+    }
+  });
+
+  it("invalidates the previous token when the thread's tool set is reissued", async () => {
+    let called = false;
+    const endpoint = await startToolProxyEndpoint({
+      onCall: async () => {
+        called = true;
+        return { ok: true, content: [] };
+      },
+    });
+    try {
+      const previous = endpoint.issueToken({
+        threadId: "thr_1",
+        allowedTools: ["bb_probe", "bb_old"],
+      });
+      const next = endpoint.issueToken({
+        threadId: "thr_1",
+        allowedTools: ["bb_probe"],
+      });
+      expect(next).not.toBe(previous);
+      expect(endpoint.bindingFor(previous)).toBeNull();
+
+      const stale = (await request(endpoint.port, {
+        threadId: "thr_1",
+        token: previous,
+        kind: "toolCall",
+        tool: "bb_probe",
+        callId: "call-1",
+        arguments: {},
+      })) as { ok: boolean };
+      expect(stale.ok).toBe(false);
+      expect(called).toBe(false);
+
+      const result = await request(endpoint.port, {
+        threadId: "thr_1",
+        token: next,
+        kind: "toolCall",
+        tool: "bb_probe",
+        callId: "call-2",
+        arguments: {},
+      });
+      expect(result).toEqual({ ok: true, content: [] });
+      expect(called).toBe(true);
+    } finally {
+      endpoint.close();
+    }
+  });
+
   it("answers a failing tool with its error instead of hanging", async () => {
     const endpoint = await startToolProxyEndpoint({
       onCall: async () => {
@@ -184,9 +305,13 @@ describe("tool proxy endpoint", () => {
       onError: () => {},
     });
     try {
+      const token = endpoint.issueToken({
+        threadId: "thr_1",
+        allowedTools: ["bb_probe"],
+      });
       const result = (await request(endpoint.port, {
         threadId: "thr_1",
-        token: endpoint.token,
+        token,
         kind: "toolCall",
         tool: "bb_probe",
         callId: "call-1",
@@ -224,6 +349,18 @@ describe("sandbox posture", () => {
       museProviderOptionsSchema.parse({ sandbox: "on" }).sandbox,
     ).toBe("on");
     expect(museProviderOptionsSchema.safeParse({ sandbox: "yes" }).success).toBe(
+      false,
+    );
+  });
+});
+
+describe("declared tool names", () => {
+  it("accepts the name bb declared and Muse's namespaced form of it", async () => {
+    const { toolIsDeclared } = await import("../src/tool-proxy/names.js");
+    expect(toolIsDeclared("bb_probe", ["bb_probe"])).toBe(true);
+    expect(toolIsDeclared("mcp__bb_bridge__bb_probe", ["bb_probe"])).toBe(true);
+    expect(toolIsDeclared("bb_secret_store", ["bb_probe"])).toBe(false);
+    expect(toolIsDeclared("mcp__bb_bridge__bb_secret_store", ["bb_probe"])).toBe(
       false,
     );
   });

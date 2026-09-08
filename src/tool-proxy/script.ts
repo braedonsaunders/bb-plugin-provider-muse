@@ -6,8 +6,8 @@
  * its own persistent dataDir on start and points Muse's config at it.
  *
  * It holds no logic of its own: every call is proxied to the bridge over a
- * loopback socket guarded by a per-process token, and the bridge is what talks
- * to bb.
+ * loopback socket guarded by a per-thread token bound to that thread's allowed
+ * tools, and the bridge is what talks to bb.
  */
 export const MUSE_TOOL_PROXY_SCRIPT = String.raw`#!/usr/bin/env node
 import { createConnection } from "node:net";
