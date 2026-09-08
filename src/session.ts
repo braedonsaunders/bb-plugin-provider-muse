@@ -69,6 +69,18 @@ export interface MuseRuntime {
   /** Approvals whose stage chain this bridge is already walking. */
   approvalsInFlight: Set<string>;
   pendingUserInputs: Map<string, MspUserInputRequestParams>;
+  /**
+   * The highest view cursor this runtime has seen, from push or from a page.
+   * View cursors are opaque and ascending, so this is the only thing a client
+   * needs to ask Muse for everything it has not been handed yet.
+   */
+  lastViewCursor: string | null;
+  /** When the child last said anything at all, for the stall watchdog. */
+  lastViewActivityAt: number;
+  reconcileTimer: NodeJS.Timeout | null;
+  reconciling: boolean;
+  /** A dropped stream is worth saying once per runtime, not once per recovery. */
+  reportedViewGap: boolean;
   closing: boolean;
 }
 
@@ -153,6 +165,11 @@ export function createRuntime(args: {
     approvalDecisions: new Map(),
     approvalsInFlight: new Set(),
     pendingUserInputs: new Map(),
+    lastViewCursor: null,
+    lastViewActivityAt: Date.now(),
+    reconcileTimer: null,
+    reconciling: false,
+    reportedViewGap: false,
     closing: false,
   };
 }

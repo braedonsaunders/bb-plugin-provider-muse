@@ -20,6 +20,7 @@ export const MSP_METHODS = {
   turnSteer: "turn/steer",
   turnInterrupt: "turn/interrupt",
   viewUnsubscribe: "view/unsubscribe",
+  viewPage: "view/page",
   approvalDecide: "approval/decide",
   approvalListPending: "approval/listPending",
   userInputAnswer: "userInput/answer",
@@ -487,6 +488,27 @@ export const mspViewGapParamsSchema = z
     sessionId: z.string().min(1),
     after: z.string(),
     next: z.string(),
+  })
+  .loose();
+
+/**
+ * `view/page` serves the session view from its source, so it answers even where
+ * the live push stream has stopped and the materialized projection on disk has
+ * been marked unavailable. Each element is an **unframed** view notification —
+ * the `{ method, params }` pair push delivery frames — so a page replays
+ * straight back through the same translator the live stream feeds.
+ *
+ * `item/delta` is never replayed: it is ephemeral-sourced. A recovered item
+ * therefore arrives as its terminal snapshot, which carries the same text.
+ */
+export const mspViewPageResultSchema = z
+  .object({
+    events: z.array(
+      z
+        .object({ method: z.string().min(1), params: z.unknown() })
+        .loose(),
+    ),
+    nextCursor: z.string().optional(),
   })
   .loose();
 

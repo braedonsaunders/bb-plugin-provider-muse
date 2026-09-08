@@ -57,7 +57,7 @@ export default function plugin(bb: BbPluginApi) {
       type: "select",
       label: "Muse's own OS sandbox",
       description:
-        "Off by default: Muse's sandbox is all-or-nothing and denies the Darwin per-user cache, so with it on no Swift or Clang compilation works — a two-line file fails to build. BB's permission modes and approvals are the enforcement surface instead. Turn it on for extra containment if your work needs no native toolchain. Full access disables it either way.",
+        "OFF BY DEFAULT — commands Muse runs are not confined by Muse's own OS sandbox, and BB's permission modes and approvals are the only enforcement surface. The default is off because Muse's sandbox is all-or-nothing and denies the Darwin per-user cache, so with it on no Swift or Clang compilation works: a two-line file fails to build. Turn it on for OS-level containment if your work needs no native toolchain. BB's Full access permission mode disables it either way.",
       options: ["off", "on"],
       default: "off",
     },
@@ -65,7 +65,7 @@ export default function plugin(bb: BbPluginApi) {
       type: "select",
       label: "Sandbox network",
       description:
-        "Network posture for sandboxed Muse shell commands. Muse's own default, proxy-only, truncates larger loopback responses and breaks the `bb` CLI that BB tells agents to use, so BB threads allow network by default. Fixed for the lifetime of a Muse host process.",
+        "NETWORK IS ALLOWED BY DEFAULT for sandboxed Muse shell commands. Muse's own default, proxy-only, truncates larger loopback responses and breaks the `bb` CLI that BB tells agents to use, so BB threads allow it. Choose proxy-only or restricted to narrow it. Applies only while Muse's OS sandbox is on, and is fixed for the lifetime of a Muse host process.",
       options: ["enabled", "proxy-only", "restricted"],
       default: "enabled",
     },

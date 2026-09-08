@@ -136,7 +136,7 @@ describe("tool proxy endpoint", () => {
     try {
       const result = await request(endpoint.port, {
         threadId: "thr_1",
-        token: endpoint.token,
+        token: endpoint.issueGrant("thr_1", ["bb_probe"]),
         kind: "toolCall",
         tool: "bb_probe",
         callId: "call-1",
@@ -176,6 +176,85 @@ describe("tool proxy endpoint", () => {
     }
   });
 
+  /**
+   * One bridge process serves every thread, so the listener is the boundary
+   * between them. A caller states its own thread id and tool name, so neither
+   * can be taken on trust: the credential has to carry both.
+   */
+  it("refuses another thread's token, and a tool outside the grant", async () => {
+    const seen: string[] = [];
+    const endpoint = await startToolProxyEndpoint({
+      onCall: async (call) => {
+        seen.push(`${call.threadId}:${call.tool}`);
+        return { ok: true, content: [] };
+      },
+    });
+    try {
+      const one = endpoint.issueGrant("thr_1", ["bb_probe"]);
+      const two = endpoint.issueGrant("thr_2", ["bb_secret"]);
+
+      /** thr_2's credential cannot be spent as thr_1. */
+      const crossed = (await request(endpoint.port, {
+        threadId: "thr_1",
+        token: two,
+        kind: "toolCall",
+        tool: "bb_probe",
+        callId: "call-1",
+        arguments: {},
+      })) as { ok: boolean };
+      expect(crossed.ok).toBe(false);
+
+      /** Nor can thr_1 reach a tool only thr_2 was granted. */
+      const undeclared = (await request(endpoint.port, {
+        threadId: "thr_1",
+        token: one,
+        kind: "toolCall",
+        tool: "bb_secret",
+        callId: "call-2",
+        arguments: {},
+      })) as { ok: boolean };
+      expect(undeclared.ok).toBe(false);
+
+      /** A revoked thread's credential stops working immediately. */
+      endpoint.revokeGrant("thr_1");
+      const revoked = (await request(endpoint.port, {
+        threadId: "thr_1",
+        token: one,
+        kind: "toolCall",
+        tool: "bb_probe",
+        callId: "call-3",
+        arguments: {},
+      })) as { ok: boolean };
+      expect(revoked.ok).toBe(false);
+
+      /** None of them reached bb. */
+      expect(seen).toEqual([]);
+    } finally {
+      endpoint.close();
+    }
+  });
+
+  it("re-minting a thread's grant retires the credential it replaces", async () => {
+    const endpoint = await startToolProxyEndpoint({
+      onCall: async () => ({ ok: true, content: [] }),
+    });
+    try {
+      const old = endpoint.issueGrant("thr_1", ["bb_probe"]);
+      endpoint.issueGrant("thr_1", ["bb_other"]);
+      const result = (await request(endpoint.port, {
+        threadId: "thr_1",
+        token: old,
+        kind: "toolCall",
+        tool: "bb_probe",
+        callId: "call-1",
+        arguments: {},
+      })) as { ok: boolean };
+      expect(result.ok).toBe(false);
+    } finally {
+      endpoint.close();
+    }
+  });
+
   it("answers a failing tool with its error instead of hanging", async () => {
     const endpoint = await startToolProxyEndpoint({
       onCall: async () => {
@@ -186,7 +265,7 @@ describe("tool proxy endpoint", () => {
     try {
       const result = (await request(endpoint.port, {
         threadId: "thr_1",
-        token: endpoint.token,
+        token: endpoint.issueGrant("thr_1", ["bb_probe"]),
         kind: "toolCall",
         tool: "bb_probe",
         callId: "call-1",

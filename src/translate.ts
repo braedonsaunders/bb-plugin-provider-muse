@@ -30,7 +30,6 @@ import {
   mspTurnRetryScheduledParamsSchema,
   mspTurnStartedParamsSchema,
   mspTurnUnqueuedParamsSchema,
-  mspViewGapParamsSchema,
   type MspItem,
 } from "./msp/schemas.js";
 import {
@@ -409,8 +408,11 @@ export class MuseTranslator {
         return this.onContextUsage(params);
       case "session/todoListChanged":
         return this.onTodoListChanged(params);
-      case "view/gap":
-        return this.onViewGap(params);
+      /**
+       * `view/gap` is answered by the bridge, not folded here: the dropped
+       * range is read back with `view/page` and replayed through this
+       * translator, so it arrives as the notifications it always was.
+       */
       default:
         return [];
     }
@@ -1003,17 +1005,5 @@ export class MuseTranslator {
     ];
   }
 
-  private onViewGap(params: unknown): ThreadDelta[] {
-    const parsed = mspViewGapParamsSchema.safeParse(params);
-    if (!parsed.success) {
-      return [];
-    }
-    return [
-      {
-        kind: "provider.warning",
-        summary: "Muse dropped view events under load",
-        details: `Undelivered range ${parsed.data.after} → ${parsed.data.next}`,
-      },
-    ];
-  }
+
 }

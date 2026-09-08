@@ -90,8 +90,21 @@ function notify(method, params) {
   send({ jsonrpc: "2.0", method, params });
 }
 
+/**
+ * Every session's view, the way a real host keeps one: the notifications push
+ * delivers are the same ones `view/page` serves back later.
+ */
+const viewLogs = new Map();
+
+/**
+ * After this many view events on a session, push delivery stops while the view
+ * itself keeps growing — the shape of a Muse projection going unavailable
+ * mid-turn, which is what leaves a thread reading as busy after Muse is done.
+ */
+const VIEW_DEAD_AFTER = Number(process.env.FAKE_MUSE_VIEW_DEAD_AFTER ?? "0");
+
 function viewMessage(sessionId, method, params) {
-  return {
+  const message = {
     jsonrpc: "2.0",
     method,
     params: {
@@ -101,10 +114,25 @@ function viewMessage(sessionId, method, params) {
       ...params,
     },
   };
+  const log = viewLogs.get(sessionId) ?? [];
+  log.push({ method: message.method, params: message.params });
+  viewLogs.set(sessionId, log);
+  return message;
+}
+
+function pushIsDead(sessionId) {
+  return (
+    VIEW_DEAD_AFTER > 0 &&
+    (viewLogs.get(sessionId)?.length ?? 0) > VIEW_DEAD_AFTER
+  );
 }
 
 function viewNotify(sessionId, method, params) {
-  send(viewMessage(sessionId, method, params));
+  const message = viewMessage(sessionId, method, params);
+  if (pushIsDead(sessionId)) {
+    return;
+  }
+  send(message);
 }
 
 function session(sessionId, extra = {}) {
@@ -466,6 +494,40 @@ function handle(message) {
         source: "providerCatalog",
       });
       return;
+
+    case "view/page": {
+      const sessionId = params?.sessionId;
+      if (!sessions.has(sessionId)) {
+        fail(-32031, `unknown session ${sessionId}`, { kind: "sessionNotFound" });
+        return;
+      }
+      if (process.env.FAKE_MUSE_VIEW_UNREADABLE === "1") {
+        fail(-32040, "no trustworthy materialized projection exists", {
+          kind: "projectionUnavailable",
+        });
+        return;
+      }
+      if (typeof params?.limit !== "number") {
+        fail(-32602, "invalid view/page params: missing field `limit`", {
+          kind: "invalidParams",
+        });
+        return;
+      }
+      const log = viewLogs.get(sessionId) ?? [];
+      const cursor = params.cursor ?? "";
+      const start =
+        cursor === ""
+          ? 0
+          : log.findIndex((entry) => entry.params.viewCursor === cursor) + 1;
+      const events = log.slice(start, start + params.limit);
+      reply({
+        events,
+        ...(events.length === 0
+          ? {}
+          : { nextCursor: events[events.length - 1].params.viewCursor }),
+      });
+      return;
+    }
 
     case "session/start": {
       const sessionId = params?.sessionId ?? randomUUID();

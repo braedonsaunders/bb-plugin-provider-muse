@@ -16,8 +16,38 @@ notifications (`item/started`, `item/delta`, `turn/completed`,
 delta grammar, so BB's assembler mints every turn and item id and Muse's own
 ids stay join keys.
 
-One `muse serve` process hosts every session that shares a sandbox posture, and
-it stays warm for a minute after the last thread detaches.
+Each thread gets its own `muse serve` child, so no thread can disturb another's
+configuration, sandbox posture, or session state.
+
+## Security posture, stated plainly
+
+**This provider runs with Muse's own OS sandbox off, and with network access
+allowed.** Both are defaults, both are settings, and the reasons are in
+[Why Muse's OS sandbox defaults to off](#why-muses-os-sandbox-defaults-to-off)
+and the section after it. What that means in practice:
+
+- A shell command Muse runs is confined by nothing at the OS level. BB's
+  permission modes and its approval flow are the enforcement surface. Under
+  `full` — BB's documented approval bypass — that surface is deliberately empty.
+- Sandboxed shell commands, if you turn the sandbox on, are allowed network by
+  default rather than Muse's `proxy-only`, because `proxy-only` truncates the
+  `bb` CLI's larger responses.
+- Set **Muse's own OS sandbox** to `on` for OS-level containment. It costs you
+  native toolchains: nothing that invokes Swift or Clang builds under it.
+
+BB's injected tools reach Muse over a loopback socket on 127.0.0.1, bound to an
+ephemeral port. One bridge process serves every thread, so that socket is a
+boundary between them: each thread's MCP server holds a credential minted for
+that thread and for the exact tools BB declared for it, and a call is answered
+only where the presented secret, the stated thread, and the named tool all
+belong to the same grant. Credentials are revoked when the thread is discarded
+and replaced when its tool set changes. The tool is checked again against the
+thread's live declaration before it runs.
+
+Your own `~/.config/muse` is read, never written: the bridge builds a private
+config directory per thread, symlinks your credentials and skills into it, and
+adds only its own MCP server, so BB's tools never appear in your terminal
+sessions.
 
 | BB | Muse |
 | --- | --- |
@@ -126,6 +156,38 @@ what Muse marks with `protectedWrite` and `judgeEscalated`.
 Every stage of a command the bridge answers is still answered, and the tool row
 still lands on the timeline, so nothing is hidden — only the question bb had
 already answered is.
+
+## A view that stops is not a turn that stopped
+
+Muse's live view can die while the session keeps running. Its materialized
+projection is marked `unavailable`, push delivery goes silent, and nothing more
+arrives — including the turn's own `turn/completed`. Observed here as threads
+reading as busy for two hours after Muse's session log recorded the turn
+finished, on roughly one session in ten.
+
+Nothing in bb rescues that. `system/provider-turn-watchdog` is decode-only —
+bb core has no current producer — so a turn only ends when its bridge says so.
+
+MSP hands a client two things for this, and the bridge now uses both.
+`view/gap` brackets a dropped range, so the range is read back rather than
+mourned in a warning. And `view/page` serves the view from the session's source
+rather than from the projection, so it still answers when push does not — which
+makes the recovery a read, not a guess.
+
+The watchdog rests on Muse being noisy: a working turn reports every tool call,
+every usage update, every scheduled retry. A turn open and silent for longer
+than any of Muse's own silences — its model-call retry announces itself at 180
+seconds — is paged. A healthy one returns an empty page and costs nothing; a
+stalled one returns everything bb missed, up to and including the terminal.
+
+Where the page cannot be served either, the turn is settled as a typed failure
+and the session is owed a rebuild, because a thread that says it failed is
+recoverable and a thread that says it is working is not.
+
+Replay carries the fold, not the interaction: an approval Muse has since
+resolved is not put back in front of you, and `item/delta` is never replayed by
+`view/page`, so a recovered message arrives as one block rather than as it was
+typed.
 
 ## Every delta names its turn
 

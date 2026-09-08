@@ -74,6 +74,8 @@ import {
   mspSessionStartResultSchema,
   mspTurnInterruptResultSchema,
   mspTurnStartResultSchema,
+  mspViewGapParamsSchema,
+  mspViewPageResultSchema,
   mspTurnSteerResultSchema,
   mspUserInputRequestParamsSchema,
   type MspApprovalRequestParams,
@@ -117,6 +119,43 @@ const COMMAND_TIMEOUT_MS = 120_000;
 const INTERRUPT_SETTLE_TIMEOUT_MS = 8_000;
 const ZERO_WORK_SETTLEMENT_GRACE_MS = 1_500;
 const SESSION_READ_TIMEOUT_MS = 15_000;
+const VIEW_PAGE_TIMEOUT_MS = 20_000;
+const VIEW_PAGE_LIMIT = 200;
+/** A page is bounded work; a session bb has fallen this far behind on is broken. */
+const VIEW_PAGE_MAX_PAGES = 200;
+/** Overridable so a suite can drive the watchdog without waiting it out. */
+function tunedMs(name: string, fallback: number): number {
+  const raw = Number(process.env[name]);
+  return Number.isFinite(raw) && raw > 0 ? raw : fallback;
+}
+
+const VIEW_WATCHDOG_TICK_MS = tunedMs(
+  "BB_MUSE_VIEW_WATCHDOG_TICK_MS",
+  30_000,
+);
+/**
+ * How long an open turn may say nothing before bb reads the view back itself.
+ * Muse's own model-call retry waits 180s before its first re-attempt and
+ * reports it, so this sits above that: a turn that is merely slow announces
+ * itself, and one that has gone quiet for longer than any of Muse's own
+ * silences is worth a page.
+ */
+const VIEW_STALL_MS = tunedMs("BB_MUSE_VIEW_STALL_MS", 240_000);
+
+/** The view fold a page may replay; everything else has a live authority. */
+const REPLAYABLE_VIEW_METHODS = new Set([
+  "turn/started",
+  "turn/completed",
+  "turn/retryScheduled",
+  "turn/unqueued",
+  "turn/retracted",
+  "item/started",
+  "item/updated",
+  "item/completed",
+  "session/tokenUsage",
+  "session/contextUsage",
+  "session/todoListChanged",
+]);
 
 /**
  * How much of a discarded conversation rides into its replacement. Enough for
@@ -365,6 +404,16 @@ async function ensureToolProxy(): Promise<ToolProxyEndpoint | null> {
   return toolProxy;
 }
 
+/**
+ * Runs one injected tool for the thread its grant is bound to.
+ *
+ * The endpoint has already established that the caller holds that thread's
+ * credential and named a tool the grant covers. This checks the tool against
+ * the attachment's live declaration as well, because the grant is a snapshot
+ * taken when the config home was written and the attachment is the authority:
+ * a tool bb has since withdrawn must not still run on a credential minted when
+ * it had not been.
+ */
 async function runInjectedTool(call: {
   threadId: string;
   tool: string;
@@ -376,6 +425,12 @@ async function runInjectedTool(call: {
     return {
       ok: false as const,
       error: `bb has no live session for thread ${call.threadId}`,
+    };
+  }
+  if (!attachment.dynamicTools.some((tool) => tool.name === call.tool)) {
+    return {
+      ok: false as const,
+      error: `bb does not offer tool ${call.tool} on thread ${call.threadId}`,
     };
   }
   const result = await sendRuntimeRequest(
@@ -428,7 +483,10 @@ async function buildConfigHome(
         /** bb ships as Electron, whose binary needs this to behave as node. */
         ELECTRON_RUN_AS_NODE: "1",
         BB_MUSE_TOOL_PORT: String(proxy.port),
-        BB_MUSE_TOOL_TOKEN: proxy.token,
+        BB_MUSE_TOOL_TOKEN: proxy.issueGrant(
+          threadId,
+          tools.map((tool) => tool.name),
+        ),
         BB_MUSE_TOOL_THREAD_ID: threadId,
         BB_MUSE_TOOLS: JSON.stringify(
           tools.map((tool) => ({
@@ -559,6 +617,9 @@ async function constructRuntime(args: {
     runtime.modelId = session.modelId;
     runtime.approvalMode = session.approvalMode ?? construction.approvalMode;
     runtime.sessionLogPath = session.path === "" ? null : session.path;
+    runtime.lastViewCursor = session.viewCursor === "" ? null : session.viewCursor;
+    runtime.lastViewActivityAt = Date.now();
+    startViewWatchdog(attachment, runtime);
 
     announceIdentity(attachment, session.sessionId);
     emitDeltas(attachment, [
@@ -571,6 +632,7 @@ async function constructRuntime(args: {
     return runtime;
   } catch (error) {
     runtime.closing = true;
+    stopViewWatchdog(runtime);
     if (attachment.runtime === runtime) {
       attachment.runtime = null;
     }
@@ -588,6 +650,8 @@ async function openSession(args: {
   modelId: string | null;
   approvalMode: string | null;
   path: string;
+  /** Where this connection's view starts; "" where Muse offers no head. */
+  viewCursor: string;
 }> {
   const { connection, construction, request } = args;
 
@@ -610,6 +674,7 @@ async function openSession(args: {
       modelId: result.session.modelId,
       approvalMode: result.session.approvalMode?.mode ?? null,
       path: result.session.path,
+      viewCursor: result.viewCursor,
     };
   }
 
@@ -631,6 +696,7 @@ async function openSession(args: {
     modelId: result.session.modelId,
     approvalMode: result.session.approvalMode?.mode ?? null,
     path: result.session.path,
+    viewCursor: result.viewCursor,
   };
 }
 
@@ -643,6 +709,7 @@ function releaseRuntime(
     return;
   }
   runtime.closing = true;
+  stopViewWatchdog(runtime);
   attachment.runtime = null;
   if (options.kill) {
     runtime.connection.kill();
@@ -651,6 +718,8 @@ function releaseRuntime(
 
 function forgetAttachment(attachment: MuseAttachment): void {
   attachment.closing = true;
+  /** The thread is gone, so its tool credential stops working now, not at exit. */
+  toolProxy?.revokeGrant(attachment.threadId);
   cancelIdleShutdown(attachment);
   releaseRuntime(attachment, { kill: true });
   attachments.delete(attachment.threadId);
@@ -685,6 +754,254 @@ function attachmentForParams(params: unknown): MuseAttachment | null {
     : null;
 }
 
+/**
+ * Records how far the view has been read and when the child last spoke. Every
+ * view notification carries its own cursor and they ascend, so the highest one
+ * seen is the whole of the resume state a page needs.
+ */
+function noteViewActivity(runtime: MuseRuntime, params: unknown): void {
+  runtime.lastViewActivityAt = Date.now();
+  const cursor = (params as { viewCursor?: unknown } | null)?.viewCursor;
+  if (typeof cursor === "string" && cursor !== "") {
+    runtime.lastViewCursor = cursor;
+  }
+}
+
+/**
+ * Feeds one page of unframed view notifications back through the translator,
+ * in order, as though push had delivered them. Returns the cursor reached.
+ */
+function replayViewEvents(
+  attachment: MuseAttachment,
+  runtime: MuseRuntime,
+  events: readonly { method: string; params: unknown }[],
+  stopBefore: string | null,
+): { cursor: string | null; stopped: boolean } {
+  let cursor: string | null = null;
+  for (const event of events) {
+    const eventCursor = (event.params as { viewCursor?: unknown } | null)
+      ?.viewCursor;
+    if (
+      stopBefore !== null &&
+      typeof eventCursor === "string" &&
+      eventCursor === stopBefore
+    ) {
+      return { cursor, stopped: true };
+    }
+    if (attachmentForParams(event.params) !== attachment) {
+      continue;
+    }
+    /**
+     * Only the view fold is replayed. An approval or a user-input prompt is
+     * protected delivery whose live state belongs to the pending fold, and
+     * re-opening one Muse has already resolved would put a settled question
+     * back in front of the user; `reopenPendingInteractions` reads that fold
+     * from the authority instead. A replayed `view/gap` would recurse.
+     */
+    if (!REPLAYABLE_VIEW_METHODS.has(event.method)) {
+      if (typeof eventCursor === "string" && eventCursor !== "") {
+        cursor = eventCursor;
+        runtime.lastViewCursor = eventCursor;
+      }
+      continue;
+    }
+    foldViewNotification(attachment, runtime, event.method, event.params);
+    if (typeof eventCursor === "string" && eventCursor !== "") {
+      cursor = eventCursor;
+      runtime.lastViewCursor = eventCursor;
+    }
+  }
+  return { cursor, stopped: false };
+}
+
+/**
+ * Reads the session view forward from where this runtime left off, replaying
+ * whatever push never delivered.
+ *
+ * This is the only thing standing between a thread and a permanent "working…".
+ * Muse's live view can stop while the session keeps running — its materialized
+ * projection is marked unavailable and no further notification arrives, so the
+ * turn's own `turn/completed` never reaches bb and the thread reads as busy
+ * long after Muse has finished. `view/page` serves from the source log rather
+ * than that projection, so it still answers, and replaying it settles the turn.
+ */
+async function reconcileView(args: {
+  attachment: MuseAttachment;
+  runtime: MuseRuntime;
+  /** The first cursor push already delivered, for a bracketed `view/gap`. */
+  stopBefore?: string | null;
+  from?: string | null;
+}): Promise<void> {
+  const { attachment, runtime } = args;
+  if (runtime.reconciling || runtime.closing || runtime.connection.exited) {
+    return;
+  }
+  const sessionId = runtime.sessionId;
+  if (sessionId === null) {
+    return;
+  }
+  runtime.reconciling = true;
+  let cursor = args.from ?? runtime.lastViewCursor ?? "";
+  let recovered = 0;
+  try {
+    for (let page = 0; page < VIEW_PAGE_MAX_PAGES; page += 1) {
+      if (liveRuntime(attachment.threadId, runtime.serial) !== runtime) {
+        return;
+      }
+      const result = await runtime.connection.request({
+        method: MSP_METHODS.viewPage,
+        params: {
+          sessionId,
+          cursor,
+          direction: "forward",
+          limit: VIEW_PAGE_LIMIT,
+        },
+        resultSchema: mspViewPageResultSchema,
+        timeoutMs: VIEW_PAGE_TIMEOUT_MS,
+      });
+      if (liveRuntime(attachment.threadId, runtime.serial) !== runtime) {
+        return;
+      }
+      if (result.events.length === 0) {
+        break;
+      }
+      recovered += result.events.length;
+      const replayed = replayViewEvents(
+        attachment,
+        runtime,
+        result.events as { method: string; params: unknown }[],
+        args.stopBefore ?? null,
+      );
+      if (replayed.stopped) {
+        break;
+      }
+      const next = replayed.cursor ?? result.nextCursor ?? null;
+      if (next === null || next === cursor) {
+        break;
+      }
+      cursor = next;
+    }
+    if (recovered > 0) {
+      runtime.lastViewActivityAt = Date.now();
+      reportViewGapOnce(attachment, runtime);
+    }
+  } catch (error) {
+    onReconcileFailed(attachment, runtime, error);
+  } finally {
+    runtime.reconciling = false;
+  }
+}
+
+function reportViewGapOnce(
+  attachment: MuseAttachment,
+  runtime: MuseRuntime,
+): void {
+  if (runtime.reportedViewGap) {
+    return;
+  }
+  runtime.reportedViewGap = true;
+  emitDeltas(attachment, [
+    {
+      kind: "provider.warning",
+      summary: "Muse stopped streaming this session; bb read it back",
+      details:
+        "Muse's live view stream dropped events for this session. bb read the missing range back from the session itself, so the transcript is complete — the streamed text of anything in that range arrives as one block rather than as it was typed.",
+    },
+  ]);
+}
+
+/**
+ * A page that cannot be served is the end of the road for this session's view:
+ * Muse declares `projectionUnavailable` as unrecoverable by paging, and a
+ * truncated or pruned view cannot be walked forward either. The turn is settled
+ * rather than left open, and the session is owed a rebuild — which is the same
+ * recovery a dead child gets, and the conversation rides across it.
+ */
+function onReconcileFailed(
+  attachment: MuseAttachment,
+  runtime: MuseRuntime,
+  error: unknown,
+): void {
+  if (runtime.closing || runtime.connection.exited) {
+    return;
+  }
+  if (runtime.openTurnIds.size === 0) {
+    return;
+  }
+  const detail = error instanceof Error ? error.message : String(error);
+  const message = `Muse stopped reporting this session and bb could not read it back: ${detail}`;
+  emitDeltas(attachment, [
+    {
+      kind: "provider.error",
+      message,
+      settlesTurn: false,
+      threadScoped: true,
+      category: "internal",
+      errorInfo: {
+        category: "internal",
+        providerCode: "viewUnreadable",
+        httpStatusCode: null,
+      },
+    },
+  ]);
+  emitDeltas(attachment, runtime.translator.settleOpenTurns("failed", message));
+  attachment.restartBeforeNextTurn = {
+    reason: "Muse's view of this session could no longer be read",
+    fresh: false,
+  };
+}
+
+async function replayViewGap(
+  attachment: MuseAttachment,
+  runtime: MuseRuntime,
+  params: unknown,
+): Promise<void> {
+  const parsed = mspViewGapParamsSchema.safeParse(params);
+  if (!parsed.success) {
+    return;
+  }
+  await reconcileView({
+    attachment,
+    runtime,
+    from: parsed.data.after,
+    stopBefore: parsed.data.next,
+  });
+}
+
+/**
+ * The watchdog. A turn that is genuinely working is noisy — Muse reports every
+ * tool call, every usage update, every scheduled retry — so a turn that has
+ * been open and silent for minutes is either a very long model call or a view
+ * that has stopped. Paging tells the two apart, cheaply and without guessing:
+ * a working turn's page is empty, and a stalled one's page carries everything
+ * bb missed, up to and including the terminal.
+ */
+function startViewWatchdog(attachment: MuseAttachment, runtime: MuseRuntime): void {
+  stopViewWatchdog(runtime);
+  const timer = setInterval(() => {
+    if (liveRuntime(attachment.threadId, runtime.serial) !== runtime) {
+      stopViewWatchdog(runtime);
+      return;
+    }
+    if (runtime.openTurnIds.size === 0 || runtime.reconciling) {
+      return;
+    }
+    if (Date.now() - runtime.lastViewActivityAt < VIEW_STALL_MS) {
+      return;
+    }
+    void reconcileView({ attachment, runtime });
+  }, VIEW_WATCHDOG_TICK_MS);
+  timer.unref?.();
+  runtime.reconcileTimer = timer;
+}
+
+function stopViewWatchdog(runtime: MuseRuntime): void {
+  if (runtime.reconcileTimer !== null) {
+    clearInterval(runtime.reconcileTimer);
+    runtime.reconcileTimer = null;
+  }
+}
+
 function handleChildNotification(
   threadId: string,
   serial: number,
@@ -699,8 +1016,18 @@ function handleChildNotification(
   if (attachmentForParams(params) !== attachment) {
     return;
   }
+  noteViewActivity(runtime, params);
 
   switch (method) {
+    /**
+     * Push delivery dropped events and told us the range. Everything in it is
+     * still in the view, so it is read back rather than mourned in a warning:
+     * an unreported `item/completed` is a row that never closes, and an
+     * unreported `turn/completed` is a thread that works forever.
+     */
+    case "view/gap":
+      void replayViewGap(attachment, runtime, params);
+      return;
     case "approval/requested":
       openApprovalInteraction(attachment, runtime, params);
       return;
@@ -750,6 +1077,21 @@ function handleChildNotification(
       break;
   }
 
+  foldViewNotification(attachment, runtime, method, params);
+}
+
+/**
+ * Folds one view notification into bb's timeline. Push and a replayed page both
+ * arrive here, because a terminal bb reads back is owed everything a terminal
+ * bb was handed is owed: the same boundary, the same typed failure, and the
+ * same rerun of the prompt that hit a condition bb knows how to clear.
+ */
+function foldViewNotification(
+  attachment: MuseAttachment,
+  runtime: MuseRuntime,
+  method: string,
+  params: unknown,
+): void {
   const recovery =
     method === "turn/completed" ? onTurnCompleted(attachment, params) : null;
 
