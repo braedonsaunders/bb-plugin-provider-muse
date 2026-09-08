@@ -43,6 +43,7 @@ beforeEach(() => {
 afterEach(() => {
   harness.restore();
   delete process.env.FAKE_MUSE_APPROVAL_SILENT;
+  delete process.env.FAKE_MUSE_APPROVAL_PROTECTED;
   rmSync(workspaceDir, { recursive: true, force: true });
 });
 
@@ -60,12 +61,32 @@ function restore(name: string, value: string | undefined): void {
   }
 }
 
+/**
+ * `accept-edits` is the one mode whose reviewer is the user, so it is the only
+ * one where an approval reaching bb is correct. `auto` and `full` are policies
+ * bb has already decided, and the suite asserts they never reach the user.
+ */
 const EXECUTION_OPTIONS = {
   model: "muse-spark-1.3",
-  permissionMode: "auto",
+  permissionMode: "accept-edits",
   permissionScope: "workspace",
-  approvalReviewer: "automatic",
+  approvalReviewer: "user",
   permissionEscalation: "ask",
+} as const;
+
+const AUTO_OPTIONS = {
+  ...EXECUTION_OPTIONS,
+  permissionMode: "auto",
+  approvalReviewer: "automatic",
+} as const;
+
+/** bb's schema rejects a reviewer or an escalation on `full`: nobody reviews. */
+const FULL_OPTIONS = {
+  ...EXECUTION_OPTIONS,
+  permissionMode: "full",
+  permissionScope: "full",
+  approvalReviewer: null,
+  permissionEscalation: null,
 } as const;
 
 interface Collected {
@@ -133,7 +154,14 @@ async function drive(
   return collected;
 }
 
-async function startTurn(): Promise<void> {
+type ExecutionOptions =
+  | typeof EXECUTION_OPTIONS
+  | typeof AUTO_OPTIONS
+  | typeof FULL_OPTIONS;
+
+async function startTurn(
+  options: ExecutionOptions = EXECUTION_OPTIONS,
+): Promise<void> {
   const threadId = `thr_${randomUUID().slice(0, 8)}`;
   harness.sendRequest(1, "initialize", {
     protocolVersion: 1,
@@ -144,7 +172,7 @@ async function startTurn(): Promise<void> {
     threadId,
     cwd: workspaceDir,
     instructionMode: "append",
-    options: EXECUTION_OPTIONS,
+    options,
   });
   const started = (await harness.waitForResponse(2)) as {
     result?: { providerThreadId?: string };
@@ -156,7 +184,7 @@ async function startTurn(): Promise<void> {
     providerThreadId,
     clientRequestId: "creq_abcdefghij",
     input: [{ type: "text", text: "run the probe", mentions: [] }],
-    options: EXECUTION_OPTIONS,
+    options,
   });
 }
 
@@ -245,4 +273,57 @@ it("stops at the first stage when the user refuses", async () => {
   expect(completedTurn(collected)).toBe(true);
   expect(agentText(collected)).toContain("abort");
   expect(agentText(collected)).not.toContain("allow_once");
+});
+
+/**
+ * The reason this provider asked for permission where none of the others did.
+ *
+ * Muse escalates any shell command its grammar cannot statically canonicalise
+ * — a substitution, a `${VAR}`, a pipeline, a heredoc — to a human, whatever
+ * approval mode the session is in. Selecting `allowAll` is therefore only half
+ * a policy; the bridge has to answer those itself, or bb's `full` ("approval
+ * bypass") and `auto` ("provider-native automatic review") both degrade into a
+ * prompt per command.
+ */
+it.each([
+  ["auto", AUTO_OPTIONS],
+  ["full", FULL_OPTIONS],
+])("never asks the user under %s, a policy bb has already decided", async (_name, options) => {
+  await startTurn(options);
+  const collected = await drive("deny", completedTurn);
+
+  expect(collected.interactions).toEqual([]);
+  expect(completedTurn(collected)).toBe(true);
+  /** Answered, not skipped: every stage of the command still gets a decision. */
+  expect(agentText(collected)).toContain("allow_once,allow_once,allow_once");
+  expect(
+    collected.deltas.filter((delta) => delta.kind === "provider.error"),
+  ).toEqual([]);
+});
+
+/**
+ * The other axis of bb's policy. `permissionEscalation` governs only a reach
+ * past the permission scope — what Muse marks with `protectedWrite` and
+ * `judgeEscalated` — so `auto` still puts those to the user, and bypassing
+ * them along with the rest would quietly widen the mode.
+ */
+it("still asks under auto when Muse flags a reach past the scope", async () => {
+  process.env.FAKE_MUSE_APPROVAL_PROTECTED = "1";
+  await startTurn(AUTO_OPTIONS);
+  const collected = await drive("allow_once", completedTurn);
+
+  expect(collected.interactions).toHaveLength(1);
+  expect(String(collected.interactions[0]?.payload.reason)).toContain(
+    "protected path",
+  );
+  expect(completedTurn(collected)).toBe(true);
+});
+
+it("asks nobody under full, even for a reach past the scope", async () => {
+  process.env.FAKE_MUSE_APPROVAL_PROTECTED = "1";
+  await startTurn(FULL_OPTIONS);
+  const collected = await drive("deny", completedTurn);
+
+  expect(collected.interactions).toEqual([]);
+  expect(completedTurn(collected)).toBe(true);
 });

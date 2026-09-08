@@ -135,6 +135,8 @@ function session(sessionId, extra = {}) {
 const APPROVAL_STAGES = Number(process.env.FAKE_MUSE_APPROVAL_STAGES ?? "0");
 /** Drops `approval/updated`, leaving the pending fold as the only way on. */
 const APPROVAL_SILENT = process.env.FAKE_MUSE_APPROVAL_SILENT === "1";
+/** Marks the approval the way Muse marks a write past the permission scope. */
+const APPROVAL_PROTECTED = process.env.FAKE_MUSE_APPROVAL_PROTECTED === "1";
 
 const approvals = new Map();
 
@@ -164,6 +166,7 @@ function approvalRequestParams(approval) {
     turnId: approval.turnId,
     toolName: "bash",
     toolCallId: "call_1",
+    ...(APPROVAL_PROTECTED ? { protectedWrite: true } : {}),
     currentRequirementId: {
       approvalId: approval.approvalId,
       sourceIndex: approval.index,

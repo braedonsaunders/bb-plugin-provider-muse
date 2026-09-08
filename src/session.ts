@@ -33,6 +33,13 @@ export interface SessionConstruction {
   cwd: string;
   posture: HostPosture;
   approvalMode: string;
+  /**
+   * What bb wants done when the agent asks to go beyond its permission scope:
+   * `ask` puts it to the user, `deny` refuses it, `null` is `full`, which has
+   * no scope to leave. It is policy, not session shape, so it stays out of
+   * `constructionSignature` — changing it must not cost a session rebuild.
+   */
+  escalation: string | null;
   model: string | undefined;
   toolNames: string[];
   instructionMode: string;

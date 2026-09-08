@@ -40,6 +40,10 @@ export const museProviderOptionsSchema = z.object({
 });
 export type MuseProviderOptions = z.infer<typeof museProviderOptionsSchema>;
 
+/** MSP's approval modes are `allowAll | promptUnmatched | onRequest | denyUnmatched`. */
+export const MUSE_APPROVAL_ALLOW_ALL = "allowAll";
+export const MUSE_APPROVAL_ON_REQUEST = "onRequest";
+
 /**
  * bb states a permission policy, not an approval prompt count. `full` is full
  * access, and `auto` names bb — not the user — as the reviewer; in both, a
@@ -49,22 +53,27 @@ export type MuseProviderOptions = z.infer<typeof museProviderOptionsSchema>;
  * Muse's sandbox is a separate constraint from its approval mode, so a
  * workspace-scoped session keeps the sandbox that bb's scope implies while
  * Muse stops asking.
+ *
+ * Selecting the mode is not the same as getting it: `allowAll` governs the
+ * rules Muse's grammar can match, and a shell command it cannot statically
+ * canonicalise escalates regardless. The bridge answers those itself — see
+ * `openApprovalInteraction` — so this mode is the whole policy, not half of it.
  */
 export function museApprovalMode(policy: {
   permissionMode: string;
   permissionScope?: string;
   approvalReviewer?: string | null;
-}): "allowAll" | "onRequest" {
+}): typeof MUSE_APPROVAL_ALLOW_ALL | typeof MUSE_APPROVAL_ON_REQUEST {
   if (policy.permissionScope === "full" || policy.permissionMode === "full") {
-    return "allowAll";
+    return MUSE_APPROVAL_ALLOW_ALL;
   }
   if (
     policy.approvalReviewer === "automatic" ||
     policy.permissionMode === "auto"
   ) {
-    return "allowAll";
+    return MUSE_APPROVAL_ALLOW_ALL;
   }
-  return "onRequest";
+  return MUSE_APPROVAL_ON_REQUEST;
 }
 
 /**

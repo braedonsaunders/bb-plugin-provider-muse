@@ -101,6 +101,7 @@ import {
 } from "./tool-proxy/endpoint.js";
 import { MUSE_TOOL_PROXY_SCRIPT } from "./tool-proxy/script.js";
 import {
+  MUSE_APPROVAL_ALLOW_ALL,
   MUSE_DEFAULT_REASONING_LEVEL,
   MUSE_REASONING_EFFORTS,
   MUSE_SESSION_EXTENSION_KIND,
@@ -273,6 +274,7 @@ type PermissionPolicy = {
   permissionMode: string;
   permissionScope?: string;
   approvalReviewer?: string | null;
+  permissionEscalation?: string | null;
 };
 
 function approvalModeFor(policy: PermissionPolicy): string {
@@ -318,6 +320,7 @@ export function buildConstruction(args: {
     cwd: args.cwd,
     posture: postureFrom(providerOptions, args.options),
     approvalMode: approvalModeFor(args.options),
+    escalation: args.options.permissionEscalation ?? null,
     model: args.options.model,
     toolNames: args.dynamicTools.map((tool) => tool.name),
     instructionMode: args.instructionMode,
@@ -929,6 +932,49 @@ export function stripMcpPrefix(tool: string): string {
  * gating the loopback connection to the tool proxy this bridge started, and
  * Muse gating a tool bb injected, which bb already governs on its own side.
  */
+/**
+ * The decision bb's own policy already carries, or `null` where the policy
+ * names the user as the reviewer and the question is genuinely theirs.
+ *
+ * Selecting Muse's `allowAll` is only half a policy. `allowAll` governs the
+ * rules Muse's grammar can match, and a shell command it cannot statically
+ * canonicalise — a `$(…)` substitution, a `${VAR}`, a pipeline, a heredoc, a
+ * loop — escalates to a human whatever the mode says. Nearly every command an
+ * agent actually writes is one of those, which is why this provider asked for
+ * permission where the first-party ones never do: the bridge was forwarding a
+ * question bb had already answered.
+ *
+ * bb's policy has two axes and this reads both. `approvalReviewer` decides who
+ * answers an ordinary call: `automatic` and `full` are the bridge, `user` is
+ * the user. `permissionEscalation` decides only what happens when the agent
+ * reaches past its permission scope, which is what Muse's own `protectedWrite`
+ * and `judgeEscalated` flags mark — so under `auto` those still reach the user
+ * when bb asked for `ask`, and are refused outright when it asked for `deny`.
+ * `full` has no scope to leave and no reviewer, so nothing there reaches anyone.
+ */
+function policyAnswerFor(
+  attachment: MuseAttachment,
+  request: MspApprovalRequestParams,
+): PendingInteractionApprovalDecision | null {
+  if (attachment.construction.approvalMode !== MUSE_APPROVAL_ALLOW_ALL) {
+    return null;
+  }
+  const escalated =
+    request.judgeEscalated === true || request.protectedWrite === true;
+  if (!escalated) {
+    return "allow_once";
+  }
+  switch (attachment.construction.escalation) {
+    case "deny":
+      return "deny";
+    case "ask":
+      return null;
+    default:
+      /** `full`: no scope to escalate out of, and no reviewer to ask. */
+      return "allow_once";
+  }
+}
+
 function isBridgeInfrastructureApproval(
   attachment: MuseAttachment,
   request: MspApprovalRequestParams,
@@ -980,6 +1026,11 @@ function openApprovalInteraction(
   }
   if (isBridgeInfrastructureApproval(attachment, request)) {
     void driveApproval(attachment, runtime, request, "allow_for_session");
+    return;
+  }
+  const settled = policyAnswerFor(attachment, request);
+  if (settled !== null) {
+    void driveApproval(attachment, runtime, request, settled);
     return;
   }
   const payload = approvalPayloadFromMsp(request);

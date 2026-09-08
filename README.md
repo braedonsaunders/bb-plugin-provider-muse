@@ -101,6 +101,32 @@ An expired login is not cleared by a new session and a rate limit is not cleared
 by anything but time, so those settle as failures and go to bb — the same split
 codex keeps, which rebuilds for both and reruns neither.
 
+## Selecting `allowAll` is only half a permission policy
+
+Muse's approval mode governs the rules its grammar can match. A shell command
+it cannot statically canonicalise — a `$(…)` substitution, a `${VAR}`, a
+pipeline, a heredoc, a `for` loop — escalates to a human whatever the mode
+says. Nearly every command an agent actually writes is one of those, so a
+bridge that sets `allowAll` and then forwards what still arrives asks for
+permission constantly while believing it asked for none.
+
+bb's policy has two axes and the bridge reads both. `approvalReviewer` decides
+who answers an ordinary call — `automatic` (bb's `auto`) and `full` are the
+bridge, `user` (`accept-edits`) is the user. `permissionEscalation` decides
+only what happens when the agent reaches past its permission scope, which is
+what Muse marks with `protectedWrite` and `judgeEscalated`.
+
+| bb policy | ordinary call | Muse flags an escalation |
+| --- | --- | --- |
+| `full` | bridge allows | bridge allows — no scope to leave, no reviewer |
+| `auto` + escalation `ask` | bridge allows | the user |
+| `auto` + escalation `deny` | bridge allows | bridge denies |
+| `accept-edits` | the user | the user |
+
+Every stage of a command the bridge answers is still answered, and the tool row
+still lands on the timeline, so nothing is hidden — only the question bb had
+already answered is.
+
 ## Every delta names its turn
 
 bb's assembler mints the ids, and it hangs an `item.*Delta` on the turn the
