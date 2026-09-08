@@ -48,6 +48,7 @@ afterEach(() => {
   harness.restore();
   delete process.env.FAKE_MUSE_VIEW_UNREADABLE;
   delete process.env.FAKE_MUSE_VIEW_BAD_ANCHOR;
+  delete process.env.FAKE_MUSE_RESUME_BROKEN;
   rmSync(workspaceDir, { recursive: true, force: true });
 });
 
@@ -281,4 +282,48 @@ it("leaves the turn running when no page can be read at all", async () => {
       String(delta.summary).includes("could not read Muse's view"),
   );
   expect(warned).toHaveLength(1);
+});
+
+/**
+ * A resume Muse refuses outright — seen as a session whose durable log it will
+ * no longer replay, "durable child logical sequence is duplicate or
+ * non-monotonic". Nothing clears that: the defect is on disk, so every later
+ * message resumes the same broken session and is rejected the same way, and
+ * the thread is unusable for good. bb's own bookkeeping is what chose to
+ * resume, so bb starts a fresh session rather than handing the user a dead
+ * thread.
+ */
+it("starts fresh when Muse refuses to reopen the session at all", async () => {
+  process.env.FAKE_MUSE_RESUME_BROKEN = "1";
+  harness.sendRequest(1, "initialize", {
+    protocolVersion: 1,
+    client: { name: "bb", version: "1" },
+  });
+  await harness.waitForResponse(1);
+  harness.sendRequest(2, "thread/resume", {
+    threadId: `thr_${randomUUID().slice(0, 8)}`,
+    cwd: workspaceDir,
+    providerThreadId: "01a0-broken-session",
+    instructionMode: "append",
+    options: OPTIONS,
+  });
+  const resumed = (await harness.waitForResponse(2)) as {
+    error?: unknown;
+    result?: { providerThreadId?: string };
+  };
+  await harness.flushWork();
+  delete process.env.FAKE_MUSE_RESUME_BROKEN;
+
+  /** The thread opens, on a session that is not the broken one. */
+  expect(resumed.error).toBeUndefined();
+  expect(resumed.result?.providerThreadId).not.toBe("01a0-broken-session");
+
+  const deltas = deltasFrom(harness.takeMessages());
+  expect(
+    deltas.find(
+      (delta) =>
+        delta.kind === "provider.warning" &&
+        String(delta.details).includes("could not reopen this session"),
+    ),
+  ).toBeDefined();
 });

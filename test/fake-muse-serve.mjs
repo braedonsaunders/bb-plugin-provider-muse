@@ -548,6 +548,18 @@ function handle(message) {
     case "session/resume":
     case "session/fork": {
       const source = params?.sessionId;
+      /** A resume Muse refuses outright: a durable log it will not replay. */
+      if (
+        method === "session/resume" &&
+        process.env.FAKE_MUSE_RESUME_BROKEN === "1"
+      ) {
+        fail(
+          -32050,
+          "internal error: seed run replay: durable child logical sequence is duplicate or non-monotonic",
+          { kind: "internal" },
+        );
+        return;
+      }
       /**
        * Each thread gets its own host process, so a session another host
        * opened is unknown here. The unviewable-resume case is about the cursor
@@ -556,7 +568,8 @@ function handle(message) {
       if (
         method === "session/resume" &&
         !sessions.has(source) &&
-        process.env.FAKE_MUSE_UNVIEWABLE_RESUME !== "1"
+        process.env.FAKE_MUSE_UNVIEWABLE_RESUME !== "1" &&
+        process.env.FAKE_MUSE_RESUME_BROKEN !== "1"
       ) {
         fail(-32031, `unknown session ${source}`, { kind: "sessionNotFound" });
         return;

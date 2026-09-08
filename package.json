@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-provider-muse",
-  "version": "0.13.2",
+  "version": "0.13.3",
   "type": "module",
   "description": "Muse Code (Meta) as a first-class BB agent provider.",
   "license": "MIT",

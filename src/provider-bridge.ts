@@ -658,15 +658,14 @@ async function constructRuntime(args: {
 async function onUnviewableSessionReplaced(
   attachment: MuseAttachment,
   connection: MspConnection,
-  abandonedSessionId: string,
+  abandoned: { sessionId: string; reason: string },
   replacementSessionId: string,
 ): Promise<void> {
-  const reason =
-    "Muse could no longer serve a view of this session, so bb started a fresh one";
+  const reason = abandoned.reason;
   attachment.pendingInstructions = attachment.instructions;
   attachment.pendingHandoff = await readSessionHandoff(
     connection,
-    abandonedSessionId,
+    abandoned.sessionId,
   );
   notify(BRIDGE_NOTIFICATION_METHODS.sessionReplaced, {
     threadId: attachment.threadId,
@@ -679,13 +678,69 @@ async function onUnviewableSessionReplaced(
       kind: "provider.warning",
       summary: "Muse started a fresh session for this thread",
       details:
-        `${reason} — a session bb cannot watch is one whose turns finish ` +
-        "without bb ever hearing about it. Durable bb state is untouched, and " +
+        `${reason}. Durable bb state is untouched, and ` +
         (attachment.pendingHandoff === null
           ? "the in-session conversation could not be read back."
           : "the conversation so far is carried into the new session as a transcript."),
     },
   ]);
+}
+
+/**
+ * Opens a fresh session to stand in for one bb could not keep, and reports the
+ * source it replaced so the caller can owe it the handoff every context loss is
+ * owed. `unsubscribe` drops a source `session/resume` had already subscribed
+ * this connection to: left attached, it goes on pushing cursors from a space
+ * the replacement cannot be paged from.
+ */
+async function startReplacementSession(
+  connection: MspConnection,
+  construction: SessionConstruction,
+  replaced: { sessionId: string; reason: string; unsubscribe?: boolean },
+): Promise<{
+  sessionId: string;
+  modelId: string | null;
+  approvalMode: string | null;
+  path: string;
+  viewCursor: string;
+  replacedUnviewable: { sessionId: string; reason: string } | null;
+}> {
+  const replacement = await connection.request({
+    method: MSP_METHODS.sessionStart,
+    params: {
+      commandId: uuidV7(),
+      workspaceRoot: construction.cwd,
+      approvalMode: construction.approvalMode,
+      ...(construction.model === undefined
+        ? {}
+        : { modelId: construction.model }),
+    },
+    resultSchema: mspSessionStartResultSchema,
+    timeoutMs: COMMAND_TIMEOUT_MS,
+  });
+  if (replaced.unsubscribe === true) {
+    try {
+      await connection.request({
+        method: MSP_METHODS.viewUnsubscribe,
+        params: { sessionId: replaced.sessionId },
+        resultSchema: mspEmptyResultSchema,
+        timeoutMs: COMMAND_TIMEOUT_MS,
+      });
+    } catch {
+      /** The session guard on every cursor is what actually has to hold. */
+    }
+  }
+  return {
+    sessionId: replacement.session.sessionId,
+    modelId: replacement.session.modelId,
+    approvalMode: replacement.session.approvalMode?.mode ?? null,
+    path: replacement.session.path,
+    viewCursor: replacement.viewCursor,
+    replacedUnviewable: {
+      sessionId: replaced.sessionId,
+      reason: replaced.reason,
+    },
+  };
 }
 
 async function openSession(args: {
@@ -700,10 +755,10 @@ async function openSession(args: {
   /** Where this connection's view starts; "" where Muse offers no head. */
   viewCursor: string;
   /**
-   * Set to the session id abandoned here: a resume Muse accepted but cannot
-   * serve a view for, replaced by a fresh session on the same connection.
+   * Set when a resume was abandoned here for a fresh session — because Muse
+   * refused it, or accepted it but could serve no view of it.
    */
-  replacedUnviewable: string | null;
+  replacedUnviewable: { sessionId: string; reason: string } | null;
 }> {
   const { connection, construction, request } = args;
 
@@ -735,15 +790,40 @@ async function openSession(args: {
     request.kind === "resume"
       ? request.providerThreadId
       : request.sourceProviderThreadId;
-  const result = await connection.request({
-    method:
-      request.kind === "resume"
-        ? MSP_METHODS.sessionResume
-        : MSP_METHODS.sessionFork,
-    params: { commandId: uuidV7(), sessionId: sourceId, excludeItems: true },
-    resultSchema: mspSessionResumeResultSchema,
-    timeoutMs: COMMAND_TIMEOUT_MS,
-  });
+  let result;
+  try {
+    result = await connection.request({
+      method:
+        request.kind === "resume"
+          ? MSP_METHODS.sessionResume
+          : MSP_METHODS.sessionFork,
+      params: { commandId: uuidV7(), sessionId: sourceId, excludeItems: true },
+      resultSchema: mspSessionResumeResultSchema,
+      timeoutMs: COMMAND_TIMEOUT_MS,
+    });
+  } catch (error) {
+    /**
+     * A resume Muse refuses outright. Seen as a session whose durable log Muse
+     * will no longer replay — "durable child logical sequence is duplicate or
+     * non-monotonic" — which no retry clears, because the defect is on disk.
+     *
+     * Propagating it rejects the user's prompt and leaves the thread unusable
+     * for good: every later message resumes the same broken session and is
+     * refused the same way. A fork is the user asking for that specific
+     * session and is left to fail, but a resume is bb's own bookkeeping, so it
+     * falls back to a fresh session with the conversation carried across.
+     */
+    if (request.kind !== "resume" || error instanceof MspExitedError) {
+      throw error;
+    }
+    return startReplacementSession(connection, construction, {
+      sessionId: sourceId,
+      reason:
+        error instanceof MspRequestError
+          ? `Muse could not reopen this session: ${error.message}`
+          : "Muse could not reopen this session",
+    });
+  }
   /**
    * A resume Muse accepts but hands no view cursor for is a session whose
    * materialized projection it can no longer stand behind. It still runs — and
@@ -754,43 +834,12 @@ async function openSession(args: {
    * transcript, the same as any other rebuild.
    */
   if (request.kind === "resume" && result.viewCursor === "") {
-    const replacement = await connection.request({
-      method: MSP_METHODS.sessionStart,
-      params: {
-        commandId: uuidV7(),
-        workspaceRoot: construction.cwd,
-        approvalMode: construction.approvalMode,
-        ...(construction.model === undefined
-          ? {}
-          : { modelId: construction.model }),
-      },
-      resultSchema: mspSessionStartResultSchema,
-      timeoutMs: COMMAND_TIMEOUT_MS,
+    return startReplacementSession(connection, construction, {
+      sessionId: sourceId,
+      reason:
+        "Muse could no longer serve a view of this session, so bb started a fresh one",
+      unsubscribe: true,
     });
-    /**
-     * `session/resume` auto-subscribes this connection, so the session bb just
-     * declined would go on pushing here — in its own cursor space, which is not
-     * a space the replacement can be paged from. Left subscribed, that is a
-     * turn settled on an anchor Muse rightly refuses.
-     */
-    try {
-      await connection.request({
-        method: MSP_METHODS.viewUnsubscribe,
-        params: { sessionId: sourceId },
-        resultSchema: mspEmptyResultSchema,
-        timeoutMs: COMMAND_TIMEOUT_MS,
-      });
-    } catch {
-      /** The session guard on every cursor is what actually has to hold. */
-    }
-    return {
-      sessionId: replacement.session.sessionId,
-      modelId: replacement.session.modelId,
-      approvalMode: replacement.session.approvalMode?.mode ?? null,
-      path: replacement.session.path,
-      viewCursor: replacement.viewCursor,
-      replacedUnviewable: sourceId,
-    };
   }
 
   return {
