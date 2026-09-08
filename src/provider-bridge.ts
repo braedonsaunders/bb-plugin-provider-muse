@@ -206,27 +206,39 @@ function emitDeltas(
   });
 }
 
+/**
+ * Announced on the first session and again whenever a rebuild replaces it.
+ *
+ * bb resolves an interactive request back to its thread through the provider
+ * thread id it last recorded, so an identity announced once and never renewed
+ * strands every approval raised on a replacement session: the request is
+ * rejected as unresolvable, and the prompt the user is owed never appears while
+ * Muse goes on holding the tool call. `session/replaced` reads as a transcript
+ * event, not a re-identification, so the identity is restated here.
+ */
 function announceIdentity(
   attachment: MuseAttachment,
   providerThreadId: string,
 ): void {
-  if (
-    attachment.providerSessionId !== null &&
-    attachment.providerSessionId !== providerThreadId
-  ) {
+  const changed = attachment.providerSessionId !== providerThreadId;
+  if (attachment.providerSessionId !== null && changed) {
     attachmentsBySessionId.delete(attachment.providerSessionId);
   }
   attachment.providerSessionId = providerThreadId;
   attachmentsBySessionId.set(providerThreadId, attachment);
-  if (attachment.identityAnnounced) {
+  if (attachment.identityAnnounced && !changed) {
     return;
   }
+  const first = !attachment.identityAnnounced;
   attachment.identityAnnounced = true;
   notify(BRIDGE_NOTIFICATION_METHODS.threadIdentity, {
     threadId: attachment.threadId,
     providerThreadId,
     sessionRestorable: true,
   });
+  if (!first) {
+    return;
+  }
   const buffered = attachment.pendingPreIdentityDeltas;
   attachment.pendingPreIdentityDeltas = [];
   if (buffered.length > 0) {

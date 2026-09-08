@@ -35,9 +35,12 @@ const INSTRUCTIONS = "You are working inside bb.";
 
 let harness: BridgeJsonRpcTestHarness;
 let workspaceDir: string;
+/** Every message the bridge sent, including notifications `drain` filters out. */
+let rawMessages: BridgeJsonRpcOutputMessage[] = [];
 
 beforeEach(() => {
   workspaceDir = mkdtempSync(join(tmpdir(), "bb-muse-recovery-"));
+  rawMessages = [];
   harness = createBridgeJsonRpcTestHarness(handleLine);
 });
 
@@ -88,7 +91,9 @@ async function drain(
   while (Date.now() < deadline) {
     await harness.flushWork();
     await new Promise((resolve) => setTimeout(resolve, 25));
-    collected.push(...deltas(harness.takeMessages()));
+    const taken = harness.takeMessages();
+    rawMessages.push(...taken);
+    collected.push(...deltas(taken));
     if (done(collected)) {
       break;
     }
@@ -182,6 +187,41 @@ it("reruns the prompt when Muse refuses the session's reasoning history", async 
   /** Accepted exactly once: the rerun is bb's, not a second client request. */
   const accepted = collected.filter((delta) => delta.kind === "input.accepted");
   expect(accepted).toHaveLength(1);
+}, 45_000);
+
+it("re-identifies the thread when a rebuild replaces the session", async () => {
+  const threadId = `thr_${randomUUID().slice(0, 8)}`;
+  await resumeThread(threadId);
+
+  harness.sendRequest(3, "turn/start", {
+    threadId,
+    providerThreadId: POISONED_SESSION_ID,
+    clientRequestId: "creq_2345678abc",
+    input: [{ type: "text", text: PROMPT }],
+    options: EXECUTION_OPTIONS,
+  });
+  await harness.waitForResponse(3);
+  await drain((seen) =>
+    seen.some((delta) => JSON.stringify(delta).includes("muse echo:")),
+  );
+
+  const identities = rawMessages
+    .map((message) => message as { method?: string; params?: unknown })
+    .filter((message) => message.method === "thread/identity")
+    .map(
+      (message) =>
+        (message.params as { providerThreadId?: string }).providerThreadId,
+    );
+
+  /**
+   * bb resolves an approval back to its thread through the provider thread id
+   * it last recorded. An identity announced once and never renewed leaves every
+   * approval on the replacement session unresolvable — the prompt never appears
+   * and Muse keeps holding the tool call.
+   */
+  expect(identities.length).toBeGreaterThanOrEqual(1);
+  expect(identities.at(-1)).not.toBe(POISONED_SESSION_ID);
+  expect(new Set(identities).size).toBe(identities.length);
 }, 45_000);
 
 it("gives up after one rerun rather than looping on a prompt", async () => {
