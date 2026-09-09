@@ -1116,6 +1116,19 @@ async function reconcileView(args: {
       runtime.quietReconciles += 1;
       abandonIfSessionStopped(attachment, runtime);
     }
+    /**
+     * An approval is protected delivery, not a view event, so a page cannot
+     * replay one and this read has not recovered it. But a dropped stream drops
+     * approvals too, and Muse blocks the whole session on one it is waiting for
+     * — indefinitely, because the request that would have reached the user is
+     * simply gone. Observed as a contributor that went quiet for fifteen minutes
+     * holding `approval_wait.effect.started` while bb showed nothing pending.
+     *
+     * `approval/listPending` is the authority and a lease-free read, so the fold
+     * is re-read whenever the stream has proven lossy. Re-opening is idempotent:
+     * anything already pending or in flight is skipped.
+     */
+    await reopenPendingInteractions(attachment, runtime);
   } catch (error) {
     /**
      * One retry from the beginning of the view before anything is concluded.

@@ -467,3 +467,50 @@ it("never folds the same source record twice", async () => {
   const keys = opens.map((delta) => JSON.stringify(delta.key));
   expect(new Set(keys).size).toBe(keys.length);
 });
+
+/**
+ * An approval lost in the gap blocks the session forever.
+ *
+ * Approvals are protected delivery, not view events, so a page cannot replay
+ * one — but a stream that drops events drops approvals too, and Muse holds the
+ * whole session on one it is waiting for. Observed as a contributor silent for
+ * fifteen minutes on `approval_wait.effect.started` while bb showed nothing
+ * pending and had nothing to answer. `approval/listPending` is the authority,
+ * so the fold is re-read whenever the stream has proven lossy.
+ */
+it("re-reads the pending approval fold after the stream drops", async () => {
+  const sessionId = randomUUID();
+  process.env.FAKE_MUSE_PENDING_APPROVAL = sessionId;
+  const threadId = newThreadId();
+  harness.sendRequest(1, "initialize", {
+    protocolVersion: 1,
+    client: { name: "bb", version: "1" },
+  });
+  await harness.waitForResponse(1);
+  harness.sendRequest(2, "thread/resume", {
+    threadId,
+    cwd: workspaceDir,
+    providerThreadId: sessionId,
+    instructionMode: "append",
+    options: { ...OPTIONS, permissionMode: "accept-edits", permissionScope: "workspace", approvalReviewer: "user", permissionEscalation: "ask" },
+  });
+  await harness.waitForResponse(2);
+
+  const deadline = Date.now() + 5_000;
+  let asked = 0;
+  while (Date.now() < deadline) {
+    await harness.flushWork();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    for (const message of harness.takeMessages()) {
+      const envelope = message as { method?: unknown };
+      if (envelope.method === "interaction/request") {
+        asked += 1;
+      }
+    }
+    if (asked > 0) break;
+  }
+  delete process.env.FAKE_MUSE_PENDING_APPROVAL;
+
+  /** The approval Muse is holding the session on reaches the user. */
+  expect(asked).toBeGreaterThan(0);
+});
