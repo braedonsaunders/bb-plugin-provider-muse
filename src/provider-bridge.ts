@@ -148,6 +148,18 @@ const VIEW_WATCHDOG_TICK_MS = tunedMs(
 const VIEW_STALL_MS = tunedMs("BB_MUSE_VIEW_STALL_MS", 600_000);
 
 /**
+ * A blocked approval deserves a much faster check than a stalled view.
+ *
+ * Paging is the expensive part of a reconcile and has to wait out a long quiet
+ * window, because a turn that says nothing is usually just busy. Re-reading the
+ * pending approval fold is neither: it is one lease-free read, and the thing it
+ * catches — Muse holding the whole session on a question that never reached
+ * bb — never resolves on its own. Ten minutes of that is ten minutes of a
+ * thread doing nothing for no reason.
+ */
+const APPROVAL_RECHECK_MS = tunedMs("BB_MUSE_APPROVAL_RECHECK_MS", 90_000);
+
+/**
  * `incomplete` is not one of MSP's turn terminals (`completed | failed |
  * cancelled`). It is what a fold reports for a run that has not reached one,
  * so a page can produce it for a turn that is running perfectly well.
@@ -1343,7 +1355,19 @@ function startViewWatchdog(attachment: MuseAttachment, runtime: MuseRuntime): vo
     if (runtime.openTurnIds.size === 0 || runtime.reconciling) {
       return;
     }
-    if (Date.now() - runtime.lastViewActivityAt < VIEW_STALL_MS) {
+    const quietFor = Date.now() - runtime.lastViewActivityAt;
+    /** Never later than the paging window, however the two are configured. */
+    const recheckAt = Math.min(APPROVAL_RECHECK_MS, VIEW_STALL_MS);
+    if (quietFor < recheckAt) {
+      return;
+    }
+    /**
+     * The cheap check first, and on its own until the view itself looks stalled:
+     * an approval bb never received blocks the session outright, and waiting out
+     * the paging window to notice costs the whole thread that time.
+     */
+    if (quietFor < VIEW_STALL_MS) {
+      void reopenPendingInteractions(attachment, runtime);
       return;
     }
     void reconcileView({ attachment, runtime });
