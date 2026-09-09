@@ -687,3 +687,52 @@ describe("assembled stream", () => {
     );
   });
 });
+
+/**
+ * Muse accepts an image on the wire and then cannot keep it: the model behind
+ * it rejects the session the moment that media replays as history — "retained
+ * media history is unsupported by target provider `muse`". That costs the
+ * conversation, not just the image, so bb does not send one.
+ *
+ * And when Muse reads one with its own tool, the failure must say so. It is
+ * the same recovery as a route change but not the same cause, and reporting a
+ * reasoning-replay fault sends the reader after something that is not there.
+ */
+describe("unsupported media", () => {
+  it("names the media, not a route change, when Muse retains an image", async () => {
+    const { classifyTurnFailure } = await import("../src/recovery.js");
+    const classified = classifyTurnFailure({
+      sessionId: SESSION_ID,
+      turnId: TURN_ID,
+      terminal: "failed",
+      error: {
+        kind: "projectionError",
+        retryable: false,
+        message:
+          "provider-private history is incompatible with the active route: retained media history is unsupported by target provider `muse`; remove the media or choose a capable provider",
+      },
+    });
+
+    expect(classified.restart).toMatchObject({ fresh: true });
+    expect(String(classified.restart?.reason)).toContain("image");
+    expect(String(classified.restart?.reason)).not.toContain("route");
+    /** Still worth rerunning: a session without the media can run. */
+    expect(classified.rerun).toBe(true);
+  });
+
+  it("still names the route change when that is what happened", async () => {
+    const { classifyTurnFailure } = await import("../src/recovery.js");
+    const classified = classifyTurnFailure({
+      sessionId: SESSION_ID,
+      turnId: TURN_ID,
+      terminal: "failed",
+      error: {
+        kind: "projectionError",
+        retryable: false,
+        message:
+          "provider-private history is incompatible with the active route: reasoning replay `rs_x:rs_y` has no provider attribution after a provider switch",
+      },
+    });
+    expect(String(classified.restart?.reason)).toContain("route");
+  });
+});

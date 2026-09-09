@@ -15,6 +15,14 @@ const RATE_LIMIT_PATTERN =
   /\b(?:429|rate[-\s]?limit(?:ed)?|quota|usage limit|resets_at|billing)\b/i;
 const INCOMPATIBLE_HISTORY_PATTERN =
   /provider-private history is incompatible|reasoning replay .* provider attribution/i;
+/**
+ * The other thing MSP reports as incompatible history, and it is not a route
+ * change: an image in the session that the model behind Muse cannot carry.
+ * Same recovery — only a session without it can run — but saying "reasoning
+ * replay after a route change" sends the reader looking for a fault that is
+ * not there, and hides the one thing that stops it recurring.
+ */
+const RETAINED_MEDIA_PATTERN = /retained media history is unsupported/i;
 
 export interface TurnFailureClassification {
   /** A rebuild is owed before the next turn. */
@@ -49,6 +57,18 @@ export function classifyTurnFailure(
    * changes, and the offending item stays in the session, so only a session
    * without that history can run again.
    */
+  if (RETAINED_MEDIA_PATTERN.test(message)) {
+    return {
+      restart: {
+        reason:
+          "Muse read an image into this session and the model behind it cannot carry media in history, so bb started a fresh session without it",
+        fresh: true,
+      },
+      rerun: true,
+      hint: null,
+    };
+  }
+
   if (INCOMPATIBLE_HISTORY_PATTERN.test(message)) {
     return {
       restart: {

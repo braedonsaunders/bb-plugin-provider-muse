@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   BRIDGE_INBOUND_REQUEST_METHODS,
@@ -16,7 +16,6 @@ import {
   experimental_defineProviderBridge,
   initializeParamsSchema,
   isStandaloneBuiltinCompactCommand,
-  mimeTypeFromExtension,
   modelListParamsSchema,
   providerInstallationRunParamsSchema,
   providerInstallationStatusParamsSchema,
@@ -2283,19 +2282,17 @@ async function turnInputParts(
           parts.push({ type: "text", text: item.text });
         }
         break;
-      case "localImage": {
-        try {
-          const bytes = await readFile(item.path);
-          parts.push({
-            type: "image",
-            base64Data: bytes.toString("base64"),
-            mediaType: mimeTypeFromExtension(item.path) ?? "image/png",
-          });
-        } catch {
-          parts.push({ type: "text", text: `@${item.path}` });
-        }
+      /**
+       * Muse takes an image on the wire and then cannot keep it: the model
+       * behind it rejects the session the moment that media is replayed as
+       * history — "retained media history is unsupported by target provider
+       * `muse`" — which costs the conversation, not just the image. A path the
+       * agent can open itself is worth more than an attachment that breaks the
+       * session it was attached to.
+       */
+      case "localImage":
+        parts.push({ type: "text", text: `@${item.path}` });
         break;
-      }
       case "localFile":
         parts.push({ type: "text", text: `@${item.path}` });
         break;
