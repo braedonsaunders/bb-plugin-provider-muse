@@ -154,12 +154,19 @@ const VIEW_STALL_MS = tunedMs("BB_MUSE_VIEW_STALL_MS", 600_000);
  */
 function isUnfinishedFold(params: unknown): boolean {
   const record = params as
-    | { terminal?: unknown; reason?: unknown; error?: { message?: unknown } }
+    | {
+        terminal?: unknown;
+        reason?: unknown;
+        error?: { message?: unknown };
+        item?: { status?: unknown };
+      }
     | null;
   return (
     record?.terminal === "incomplete" ||
     record?.reason === "incomplete" ||
-    record?.error?.message === "incomplete"
+    record?.error?.message === "incomplete" ||
+    /** The same fold one level down: a tool call that has not returned yet. */
+    record?.item?.status === "incomplete"
   );
 }
 
@@ -1004,14 +1011,20 @@ function replayViewEvents(
       continue;
     }
     /**
-     * A page folds a view for a run that may still be going, and it reports an
-     * unfinished run as `incomplete`. That is not a terminal — it is the fold
-     * saying "not done" — and treating it as one ends a turn that is still
-     * working. It killed three long-running commands here before this check,
-     * including a four-minute foreground GPU job that was fine. Only push,
-     * a dead child, or the abandon path may end a turn.
+     * A page folds a view for work that may still be going, and reports what
+     * has not finished as `incomplete`. That is not a terminal — it is the fold
+     * saying "not done" — and treating it as one ends work that is still
+     * running. At turn level it killed three long commands here, including a
+     * four-minute foreground GPU job that was fine. At item level it closed a
+     * 24GB `Get-FileHash` as failed, with no exit code and no output, while the
+     * process was measurably still running. Only push, a dead child, or the
+     * abandon path may end either.
      */
-    if (event.method === "turn/completed" && isUnfinishedFold(event.params)) {
+    if (
+      (event.method === "turn/completed" ||
+        event.method === "item/completed") &&
+      isUnfinishedFold(event.params)
+    ) {
       if (typeof eventCursor === "string" && eventCursor !== "") {
         cursor = eventCursor;
         runtime.lastViewCursor = eventCursor;

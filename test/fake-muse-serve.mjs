@@ -364,6 +364,25 @@ function runTurn(sessionId, turnId, promptText) {
         callId: "call_long",
       },
     });
+    /** The same fold one level down: the running tool, reported unfinished. */
+    viewLogs.get(sessionId)?.push({
+      method: "item/completed",
+      params: {
+        sessionId,
+        viewCursor: nextCursor(),
+        sourceRange: sourceRange(sessionId),
+        item: {
+          itemId,
+          kind: "toolCall",
+          status: "incomplete",
+          revision: 2,
+          turnId,
+          tool: "muse.bash",
+          args: JSON.stringify({ command: "sleep 600" }),
+          callId: "call_long",
+        },
+      },
+    });
     /** Only a page ever sees this, and it is a fold, not a terminal. */
     viewLogs.get(sessionId)?.push({
       method: "turn/completed",
