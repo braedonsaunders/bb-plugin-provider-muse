@@ -131,6 +131,32 @@ An expired login is not cleared by a new session and a rate limit is not cleared
 by anything but time, so those settle as failures and go to bb — the same split
 codex keeps, which rebuilds for both and reruns neither.
 
+## Working on this bridge without taking threads down with you
+
+`bb plugin reload` builds a new host artifact and points bb at it. It does not
+move **running** bridge workers onto it — each keeps serving its attached
+threads from the artifact it started on, and a new one is spawned only when a
+thread next attaches. So a fix does not reach a thread that is already running.
+
+The tempting shortcut is to kill the workers. Do not. A `muse serve` child is
+the live end of somebody's turn, and its own children — a build, a test run, an
+`ssh` holding a remote job — go with it. Killed this way they are SIGKILLed
+mid-command with no terminal, and anything that survives does so only by being
+reparented to init. It has already cost a running GPU training job here, which
+is why this section exists.
+
+The safe shape:
+
+- Ship the fix, reload, and let it reach threads as they attach. Threads already
+  running keep the build they started on until they end on their own.
+- Where one thread genuinely needs the new code now, stop that thread — `bb
+  thread stop <id>` settles its turn and releases the runtime — and let it
+  rebuild on the next message. One thread, chosen deliberately, with whoever
+  owns it told first.
+- To confirm what a worker is actually running, compare the artifact hash in its
+  command line against `shasum -a 256 dist/host.js`. The artifact directory is
+  named for that hash, so they match exactly when the worker is current.
+
 ## Selecting `allowAll` is only half a permission policy
 
 Muse's approval mode governs the rules its grammar can match. A shell command
