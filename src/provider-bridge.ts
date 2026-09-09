@@ -1049,7 +1049,11 @@ async function reconcileView(args: {
     }
     if (recovered > 0) {
       runtime.lastViewActivityAt = Date.now();
+      runtime.quietReconciles = 0;
       reportViewGapOnce(attachment, runtime);
+    } else if (runtime.openTurnIds.size > 0) {
+      runtime.quietReconciles += 1;
+      abandonIfSessionStopped(attachment, runtime);
     }
   } catch (error) {
     /**
@@ -1102,6 +1106,65 @@ function reportViewGapOnce(
  * That is the worse trade, and it is the one this made before the check.
  */
 const VIEW_FATAL_KINDS = new Set(["projectionUnavailable"]);
+
+/**
+ * How many reads in a row may come back empty, with a turn open and push
+ * silent, before bb calls the session stopped rather than slow.
+ *
+ * The evidence is what makes this safe to act on. A slow turn is not quiet: a
+ * model call still reports its usage, its retries, and its tool rows, and any
+ * of that resets the count. Only a session that has produced nothing at all —
+ * not on the wire, not in its own view when asked directly — runs the count up,
+ * and Muse's longest observed single model call is under three minutes against
+ * the ten-plus this takes.
+ */
+function viewAbandonReads(): number {
+  return Math.max(1, Math.round(tunedMs("BB_MUSE_VIEW_ABANDON_READS", 20)));
+}
+
+/**
+ * The bounded end of a turn nothing will ever finish. Left open it is the
+ * original bug — a thread that reads as working forever — and settled early it
+ * is the one after that, a failure reported over live work. This settles only
+ * on the evidence that neither is true: repeated direct reads of the session's
+ * own view, all empty.
+ */
+function abandonIfSessionStopped(
+  attachment: MuseAttachment,
+  runtime: MuseRuntime,
+): void {
+  if (runtime.quietReconciles < viewAbandonReads()) {
+    return;
+  }
+  if (runtime.closing || runtime.openTurnIds.size === 0) {
+    return;
+  }
+  const message =
+    "Muse stopped reporting this turn and its own view of the session has " +
+    "nothing further in it. bb waited, read the session back repeatedly, and " +
+    "found no more work and no terminal, so the turn is settled here rather " +
+    "than left running forever. Your next message rebuilds the session.";
+  emitDeltas(attachment, [
+    {
+      kind: "provider.error",
+      message,
+      settlesTurn: false,
+      threadScoped: true,
+      category: "internal",
+      errorInfo: {
+        category: "internal",
+        providerCode: "sessionStopped",
+        httpStatusCode: null,
+      },
+    },
+  ]);
+  emitDeltas(attachment, runtime.translator.settleOpenTurns("failed", message));
+  runtime.quietReconciles = 0;
+  attachment.restartBeforeNextTurn = {
+    reason: "Muse stopped reporting this session",
+    fresh: false,
+  };
+}
 
 function onReconcileFailed(
   attachment: MuseAttachment,
@@ -2251,8 +2314,14 @@ function scheduleZeroWorkSettlement(args: {
   clientRequestId: string;
 }): void {
   const { attachment, runtime, clientRequestId } = args;
+  /**
+   * The turn count as this prompt went out. A turn that opens after it — over
+   * push, or recovered by a read — is this prompt's work, and no settlement may
+   * be invented over it.
+   */
+  const openedBefore = runtime.turnsOpened;
   const timer = setTimeout(() => {
-    void settleIfNoWork(attachment, runtime, clientRequestId);
+    void settleIfNoWork(attachment, runtime, clientRequestId, openedBefore);
   }, ZERO_WORK_SETTLEMENT_GRACE_MS);
   timer.unref?.();
 }
@@ -2272,17 +2341,22 @@ async function settleIfNoWork(
   attachment: MuseAttachment,
   runtime: MuseRuntime,
   clientRequestId: string,
+  openedBefore: number,
 ): Promise<void> {
+  const settled = (live: MuseRuntime | null): boolean =>
+    live === null ||
+    live.openTurnIds.size > 0 ||
+    live.turnsOpened !== openedBefore;
   {
     const live = liveRuntime(attachment.threadId, runtime.serial);
-    if (live === null || live.openTurnIds.size > 0) {
+    if (settled(live)) {
       return;
     }
     await reconcileView({ attachment, runtime });
   }
   {
     const live = liveRuntime(attachment.threadId, runtime.serial);
-    if (live === null || live.openTurnIds.size > 0) {
+    if (settled(live)) {
       return;
     }
     zeroWorkCounter += 1;

@@ -49,6 +49,8 @@ afterEach(() => {
   delete process.env.FAKE_MUSE_VIEW_UNREADABLE;
   delete process.env.FAKE_MUSE_VIEW_BAD_ANCHOR;
   delete process.env.FAKE_MUSE_RESUME_BROKEN;
+  delete process.env.BB_MUSE_VIEW_ABANDON_READS;
+  delete process.env.FAKE_MUSE_SESSION_STOPPED;
   rmSync(workspaceDir, { recursive: true, force: true });
 });
 
@@ -324,6 +326,36 @@ it("starts fresh when Muse refuses to reopen the session at all", async () => {
       (delta) =>
         delta.kind === "provider.warning" &&
         String(delta.details).includes("could not reopen this session"),
+    ),
+  ).toBeDefined();
+});
+
+/**
+ * The bounded end of a turn nothing will ever finish.
+ *
+ * Muse can stop mid-turn: its view projection goes unavailable, its own session
+ * log stops growing, and the child stays alive holding a turn that will never
+ * terminate. Left open that is the original bug; settled on a timer it is the
+ * one after it, a failure reported over live work. Only repeated direct reads
+ * of the session's own view, all empty, distinguish stopped from slow.
+ */
+it("settles a turn once repeated reads show the session has stopped", async () => {
+  process.env.BB_MUSE_VIEW_ABANDON_READS = "2";
+  process.env.FAKE_MUSE_SESSION_STOPPED = "1";
+  const deltas = await runTurn(6_000);
+  delete process.env.BB_MUSE_VIEW_ABANDON_READS;
+  delete process.env.FAKE_MUSE_SESSION_STOPPED;
+
+  const boundary = deltas.find(
+    (delta) => delta.kind === "turn.boundary" && delta.status === "failed",
+  );
+  expect(boundary).toBeDefined();
+  expect(
+    deltas.find(
+      (delta) =>
+        delta.kind === "provider.error" &&
+        (delta.errorInfo as { providerCode?: string } | undefined)
+          ?.providerCode === "sessionStopped",
     ),
   ).toBeDefined();
 });

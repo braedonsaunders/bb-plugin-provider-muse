@@ -508,7 +508,8 @@ export const mspViewPageResultSchema = z
         .object({ method: z.string().min(1), params: z.unknown() })
         .loose(),
     ),
-    nextCursor: z.string().optional(),
+    /** Null on an exhausted page: there is no cursor after the end. */
+    nextCursor: z.string().nullable().optional(),
   })
   .loose();
 

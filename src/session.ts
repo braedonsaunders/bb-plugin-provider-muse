@@ -83,6 +83,18 @@ export interface MuseRuntime {
   reportedViewGap: boolean;
   /** Likewise a read bb could not make; the turn keeps running either way. */
   reportedViewReadFailure: boolean;
+  /**
+   * Consecutive reads that came back with nothing while a turn was open. One is
+   * a slow model call; a long run of them is a session that has stopped.
+   */
+  quietReconciles: number;
+  /**
+   * How many turns this runtime has ever opened. A prompt that opens none is a
+   * prompt the provider answered without working; anything else is a turn, and
+   * whether bb heard about it over push or by reading the view back is not a
+   * difference the settlement may depend on.
+   */
+  turnsOpened: number;
   closing: boolean;
 }
 
@@ -173,6 +185,8 @@ export function createRuntime(args: {
     reconciling: false,
     reportedViewGap: false,
     reportedViewReadFailure: false,
+    quietReconciles: 0,
+    turnsOpened: 0,
     closing: false,
   };
 }
@@ -223,6 +237,7 @@ export function noteOutboundDeltas(
   for (const delta of deltas) {
     if (delta.kind === "turn.open" && delta.providerTurnId !== undefined) {
       runtime.openTurnIds.add(delta.providerTurnId);
+      runtime.turnsOpened += 1;
     }
     if (delta.kind === "turn.boundary" && delta.providerTurnId !== undefined) {
       runtime.openTurnIds.delete(delta.providerTurnId);

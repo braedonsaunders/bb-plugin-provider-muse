@@ -336,6 +336,15 @@ function finishTurn(sessionId, turnId, toolItemId, promptText, refused, decision
 function runTurn(sessionId, turnId, promptText) {
   viewNotify(sessionId, "turn/started", { turnId, commandId: turnId });
 
+  /**
+   * A session that stops mid-turn: the turn is open, the child is alive, and
+   * nothing more is ever pushed or written to the view. Neither push nor a
+   * direct read will ever produce a terminal.
+   */
+  if (process.env.FAKE_MUSE_SESSION_STOPPED === "1") {
+    return;
+  }
+
   const toolItemId = `${turnId}-tool`;
   viewNotify(sessionId, "item/started", {
     item: {
