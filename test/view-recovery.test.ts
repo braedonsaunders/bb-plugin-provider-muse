@@ -28,13 +28,20 @@ const previousExecutable = process.env.BB_MUSE_EXECUTABLE;
 const previousApiKey = process.env.META_API_KEY;
 process.env.BB_MUSE_EXECUTABLE = join(fixtureDir, "fake-muse-serve.mjs");
 process.env.META_API_KEY = "view-recovery-key";
-/** Push stops after the first view event, which is `turn/started`. */
-process.env.FAKE_MUSE_VIEW_DEAD_AFTER = "1";
-/** The watchdog's own clock, shortened so the suite does not wait it out. */
+/**
+ * The watchdog's own clock, shortened so the suite does not wait it out. These
+ * are read when the bridge module is evaluated, so they have to be set before
+ * the import — and cleared straight after it, because `process.env` is shared
+ * with every other test file in this process and a 150ms stall inside the
+ * conformance suite makes its timeline unrecognisable.
+ */
 process.env.BB_MUSE_VIEW_STALL_MS = "150";
 process.env.BB_MUSE_VIEW_WATCHDOG_TICK_MS = "50";
 
 const { handleLine } = await import("../src/provider-bridge.js");
+
+delete process.env.BB_MUSE_VIEW_STALL_MS;
+delete process.env.BB_MUSE_VIEW_WATCHDOG_TICK_MS;
 
 let harness: BridgeJsonRpcTestHarness;
 let workspaceDir: string;
@@ -56,9 +63,16 @@ beforeEach(() => {
   workspaceDir = mkdtempSync(join(tmpdir(), "bb-muse-view-"));
   harness = createBridgeJsonRpcTestHarness(handleLine);
   openedThreads = [];
+  /**
+   * Read by the scripted host when it is spawned, so it has to be live for the
+   * duration of a test — and gone afterwards, or another file's hosts inherit
+   * a push stream that dies after one event.
+   */
+  process.env.FAKE_MUSE_VIEW_DEAD_AFTER = "1";
 });
 
 afterEach(async () => {
+  delete process.env.FAKE_MUSE_VIEW_DEAD_AFTER;
   for (const threadId of openedThreads) {
     handleLine(
       JSON.stringify({
@@ -83,9 +97,6 @@ afterEach(async () => {
 afterAll(() => {
   restore("BB_MUSE_EXECUTABLE", previousExecutable);
   restore("META_API_KEY", previousApiKey);
-  delete process.env.FAKE_MUSE_VIEW_DEAD_AFTER;
-  delete process.env.BB_MUSE_VIEW_STALL_MS;
-  delete process.env.BB_MUSE_VIEW_WATCHDOG_TICK_MS;
 });
 
 function restore(name: string, value: string | undefined): void {
