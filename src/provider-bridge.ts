@@ -2457,7 +2457,29 @@ async function submitTurn(args: {
     if (attachment.inFlightTurn === submitted) {
       submitted.providerTurnId = started.turnId;
     }
-    if (args.clientRequestId !== undefined) {
+    /**
+     * Muse's reply is authoritative about whether a turn exists, and it is the
+     * only place bb learns that before the view says so. A session whose view
+     * has stopped accepts the prompt and starts the turn while never reporting
+     * `turn/started`, which is indistinguishable from a prompt handled without
+     * work — and settling that as a completed turn is how a user's message gets
+     * accepted, marked done, and never run.
+     *
+     * So the turn is opened here, on Muse's word. The translator dedupes the
+     * `turn/started` that normally follows, and everything downstream — the
+     * watchdog, the abandon logic, `settleOpenTurns` — now sees a turn to
+     * account for rather than silence to guess at.
+     */
+    if (started.startedNewTurn) {
+      emitDeltas(attachment, runtime.translator.adoptOpenTurn(started.turnId));
+    }
+    /**
+     * Only a prompt Muse says it started no turn for can be settled as one that
+     * needed no work. If it started a turn, the turn is the authority on how
+     * this ends — even if the view never reports it, which is a stalled session
+     * for the watchdog to settle as a failure, not a completion to invent.
+     */
+    if (args.clientRequestId !== undefined && !started.startedNewTurn) {
       scheduleZeroWorkSettlement({
         attachment,
         runtime,

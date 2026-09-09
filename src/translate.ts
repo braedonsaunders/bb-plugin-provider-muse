@@ -369,6 +369,20 @@ export class MuseTranslator {
     return this.openTurnIds.has(turnId);
   }
 
+  /**
+   * Adopts a turn the bridge opened on Muse's `turn/start` reply rather than on
+   * a view notification. The fold has to know about it or `settleOpenTurns`
+   * cannot close it, and the `turn/started` that normally follows would open it
+   * a second time.
+   */
+  adoptOpenTurn(turnId: string): ThreadDelta[] {
+    if (this.openTurnIds.has(turnId)) {
+      return [];
+    }
+    this.openTurnIds.add(turnId);
+    return [{ kind: "turn.open", providerTurnId: turnId }];
+  }
+
   settleOpenTurns(status: ThreadEventTurnStatus, message: string): ThreadDelta[] {
     const deltas: ThreadDelta[] = [];
     for (const turnId of this.openTurnIds) {

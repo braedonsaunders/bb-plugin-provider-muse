@@ -38,13 +38,38 @@ const { handleLine } = await import("../src/provider-bridge.js");
 
 let harness: BridgeJsonRpcTestHarness;
 let workspaceDir: string;
+/**
+ * The bridge keeps its attachments in module state, and a runtime left behind
+ * by a finished test keeps its stall watchdog ticking against a host that is
+ * still up — which is enough to change what the next test's watchdog observes.
+ * Each test's thread is discarded, which is what releases both.
+ */
+let openedThreads: string[] = [];
+
+function newThreadId(): string {
+  const id = `thr_${randomUUID().slice(0, 8)}`;
+  openedThreads.push(id);
+  return id;
+}
 
 beforeEach(() => {
   workspaceDir = mkdtempSync(join(tmpdir(), "bb-muse-view-"));
   harness = createBridgeJsonRpcTestHarness(handleLine);
+  openedThreads = [];
 });
 
-afterEach(() => {
+afterEach(async () => {
+  for (const threadId of openedThreads) {
+    handleLine(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: `discard-${threadId}`,
+        method: "thread/discard",
+        params: { threadId },
+      }),
+    );
+  }
+  await harness.flushWork();
   harness.restore();
   delete process.env.FAKE_MUSE_VIEW_UNREADABLE;
   delete process.env.FAKE_MUSE_VIEW_BAD_ANCHOR;
@@ -92,7 +117,7 @@ function deltasFrom(
 }
 
 async function runTurn(windowMs = 8_000): Promise<Record<string, unknown>[]> {
-  const threadId = `thr_${randomUUID().slice(0, 8)}`;
+  const threadId = newThreadId();
   harness.sendRequest(1, "initialize", {
     protocolVersion: 1,
     client: { name: "bb", version: "1" },
@@ -196,7 +221,7 @@ it("does not invent a completed turn while the view is merely quiet", async () =
  */
 it("refuses to resume a session Muse can no longer show", async () => {
   /** A session the host knows, so the resume itself succeeds. */
-  const seed = `thr_${randomUUID().slice(0, 8)}`;
+  const seed = newThreadId();
   harness.sendRequest(1, "initialize", {
     protocolVersion: 1,
     client: { name: "bb", version: "1" },
@@ -217,7 +242,7 @@ it("refuses to resume a session Muse can no longer show", async () => {
 
   process.env.FAKE_MUSE_UNVIEWABLE_RESUME = "1";
   harness.sendRequest(3, "thread/resume", {
-    threadId: `thr_${randomUUID().slice(0, 8)}`,
+    threadId: newThreadId(),
     cwd: workspaceDir,
     providerThreadId: staleSession,
     instructionMode: "append",
@@ -303,7 +328,7 @@ it("starts fresh when Muse refuses to reopen the session at all", async () => {
   });
   await harness.waitForResponse(1);
   harness.sendRequest(2, "thread/resume", {
-    threadId: `thr_${randomUUID().slice(0, 8)}`,
+    threadId: newThreadId(),
     cwd: workspaceDir,
     providerThreadId: "01a0-broken-session",
     instructionMode: "append",
@@ -356,6 +381,42 @@ it("settles a turn once repeated reads show the session has stopped", async () =
         delta.kind === "provider.error" &&
         (delta.errorInfo as { providerCode?: string } | undefined)
           ?.providerCode === "sessionStopped",
+    ),
+  ).toBeDefined();
+});
+
+/**
+ * The worst failure this bridge can produce: a message accepted, marked done,
+ * and never run.
+ *
+ * A session whose view has stopped still accepts a prompt and still starts the
+ * turn — it just never reports `turn/started`. That is indistinguishable from a
+ * prompt the provider answered without working, and settling it as a completed
+ * turn silently discards what the user asked for. Observed in the wild: Muse
+ * recorded `user_intent.accepted`, started nothing bb could see, and the turn
+ * was reported complete one second later with no output and no tools.
+ *
+ * Muse's own `turn/start` reply is the authority, so a turn it says it started
+ * is never settled as a no-op.
+ */
+it("never reports a prompt done when Muse said it started a turn", async () => {
+  process.env.FAKE_MUSE_SESSION_STOPPED = "1";
+  const deltas = await runTurn(4_000);
+  delete process.env.FAKE_MUSE_SESSION_STOPPED;
+
+  const fabricated = deltas.filter(
+    (delta) =>
+      delta.kind === "turn.boundary" && delta.status === "completed",
+  );
+  expect(fabricated).toEqual([]);
+
+  /** The turn Muse acknowledged is on the timeline and still bb's to account for. */
+  expect(
+    deltas.find(
+      (delta) =>
+        delta.kind === "turn.open" &&
+        typeof delta.providerTurnId === "string" &&
+        !delta.providerTurnId.startsWith("zero-work"),
     ),
   ).toBeDefined();
 });
