@@ -26,6 +26,12 @@ those itself under a policy bb has already decided, and asks you only where bb
 named you the reviewer, or where Muse flags a reach past your permission scope
 and bb asked for that to be escalated.
 
+Steering a running thread is queued, not injected. Muse finishes the model call
+it is on, then picks up what you sent at the turn boundary — so a reply that
+looks like it ignored you is usually the previous prompt finishing, with your
+message about to be answered by the turn that opens right after it. Stop the
+thread first if you need to cut a running call short.
+
 Injected tools reach Muse through an MCP server the bridge starts for that
 thread, configured in a private directory. Your own Muse settings and
 credentials are read, never written, and bb's tools never appear in your

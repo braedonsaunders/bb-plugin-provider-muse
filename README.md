@@ -157,6 +157,32 @@ Every stage of a command the bridge answers is still answered, and the tool row
 still lands on the timeline, so nothing is hidden — only the question bb had
 already answered is.
 
+## A steer lands at the next turn boundary, not in the running turn
+
+MSP documents `turn/steer` as injecting input into the turn the caller names.
+Muse's implementation queues it: the session records `inbox_item_queued`, the
+running model call finishes on the instructions it already had, and the queued
+input is drained at the turn terminal into the run that follows. The result
+carries no disposition, so a client cannot tell an injected steer from a queued
+one — the bridge sends the steer bb asked it to send and has nothing further to
+report.
+
+This matters more here than it would elsewhere, because Muse Spark's model calls
+are long. Measured on this host, a steer waited between 33 seconds and 3 minutes
+34 seconds before the model saw it, against a turn whose time to first token was
+12.5 minutes.
+
+Two things follow, and both have been mistaken for defects:
+
+- **A stale-looking answer right after you steer is the previous prompt
+  finishing.** It is not the steer being ignored. The tell is what happens next:
+  a new turn opens immediately and starts the steered work.
+- **Interrupting at that moment throws the steer away.** The run that was about
+  to act on it is the one being cancelled, seconds after it started.
+
+Where the redirection has to be immediate, stop the thread first and then send.
+Nothing else cuts an in-flight model call short.
+
 ## A view that stops is not a turn that stopped
 
 Muse's live view can die while the session keeps running. Its materialized
