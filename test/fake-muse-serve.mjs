@@ -345,6 +345,40 @@ function runTurn(sessionId, turnId, promptText) {
     return;
   }
 
+  /**
+   * A long foreground command: the turn is open and working, push says nothing
+   * for its duration, and the view a page folds for it reports the run as
+   * `incomplete` because it has not finished. Nothing is wrong.
+   */
+  if (process.env.FAKE_MUSE_LONG_COMMAND === "1") {
+    const itemId = `${turnId}-long`;
+    viewNotify(sessionId, "item/started", {
+      item: {
+        itemId,
+        kind: "toolCall",
+        status: "inProgress",
+        revision: 1,
+        turnId,
+        tool: "muse.bash",
+        args: JSON.stringify({ command: "sleep 600" }),
+        callId: "call_long",
+      },
+    });
+    /** Only a page ever sees this, and it is a fold, not a terminal. */
+    viewLogs.get(sessionId)?.push({
+      method: "turn/completed",
+      params: {
+        sessionId,
+        viewCursor: nextCursor(),
+        sourceRange: sourceRange(sessionId),
+        turnId,
+        terminal: "incomplete",
+        reason: "incomplete",
+      },
+    });
+    return;
+  }
+
   const toolItemId = `${turnId}-tool`;
   viewNotify(sessionId, "item/started", {
     item: {

@@ -140,7 +140,28 @@ const VIEW_WATCHDOG_TICK_MS = tunedMs(
  * itself, and one that has gone quiet for longer than any of Muse's own
  * silences is worth a page.
  */
-const VIEW_STALL_MS = tunedMs("BB_MUSE_VIEW_STALL_MS", 240_000);
+/**
+ * A read is a recovery mechanism, and being slow to recover costs far less than
+ * reading back a turn that is merely busy. Four minutes was under the length of
+ * an ordinary foreground command here, so it fired constantly on healthy work.
+ */
+const VIEW_STALL_MS = tunedMs("BB_MUSE_VIEW_STALL_MS", 600_000);
+
+/**
+ * `incomplete` is not one of MSP's turn terminals (`completed | failed |
+ * cancelled`). It is what a fold reports for a run that has not reached one,
+ * so a page can produce it for a turn that is running perfectly well.
+ */
+function isUnfinishedFold(params: unknown): boolean {
+  const record = params as
+    | { terminal?: unknown; reason?: unknown; error?: { message?: unknown } }
+    | null;
+  return (
+    record?.terminal === "incomplete" ||
+    record?.reason === "incomplete" ||
+    record?.error?.message === "incomplete"
+  );
+}
 
 /** The view fold a page may replay; everything else has a live authority. */
 const REPLAYABLE_VIEW_METHODS = new Set([
@@ -911,6 +932,14 @@ function attachmentForParams(params: unknown): MuseAttachment | null {
  * view notification carries its own cursor and they ascend, so the highest one
  * seen is the whole of the resume state a page needs.
  */
+function sourceSequenceOf(params: unknown): number | null {
+  const range = (params as { sourceRange?: unknown } | null)?.sourceRange as
+    | { last?: { sequence?: unknown } }
+    | undefined;
+  const sequence = range?.last?.sequence;
+  return typeof sequence === "number" ? sequence : null;
+}
+
 function noteViewActivity(runtime: MuseRuntime, params: unknown): void {
   runtime.lastViewActivityAt = Date.now();
   const record = params as
@@ -930,6 +959,10 @@ function noteViewActivity(runtime: MuseRuntime, params: unknown): void {
   const cursor = record.viewCursor;
   if (typeof cursor === "string" && cursor !== "") {
     runtime.lastViewCursor = cursor;
+  }
+  const sequence = sourceSequenceOf(params);
+  if (sequence !== null && sequence > runtime.deliveredThroughSequence) {
+    runtime.deliveredThroughSequence = sequence;
   }
 }
 
@@ -955,6 +988,34 @@ function replayViewEvents(
       return { cursor, stopped: true };
     }
     if (attachmentForParams(event.params) !== attachment) {
+      continue;
+    }
+    /**
+     * Never fold the same source record twice. A re-read from the start of the
+     * view is otherwise the whole session again: every command, every result,
+     * duplicated on the timeline underneath the live turn.
+     */
+    const sequence = sourceSequenceOf(event.params);
+    if (sequence !== null && sequence <= runtime.deliveredThroughSequence) {
+      if (typeof eventCursor === "string" && eventCursor !== "") {
+        cursor = eventCursor;
+        runtime.lastViewCursor = eventCursor;
+      }
+      continue;
+    }
+    /**
+     * A page folds a view for a run that may still be going, and it reports an
+     * unfinished run as `incomplete`. That is not a terminal — it is the fold
+     * saying "not done" — and treating it as one ends a turn that is still
+     * working. It killed three long-running commands here before this check,
+     * including a four-minute foreground GPU job that was fine. Only push,
+     * a dead child, or the abandon path may end a turn.
+     */
+    if (event.method === "turn/completed" && isUnfinishedFold(event.params)) {
+      if (typeof eventCursor === "string" && eventCursor !== "") {
+        cursor = eventCursor;
+        runtime.lastViewCursor = eventCursor;
+      }
       continue;
     }
     /**

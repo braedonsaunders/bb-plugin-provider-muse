@@ -84,6 +84,13 @@ export interface MuseRuntime {
   /** Likewise a read bb could not make; the turn keeps running either way. */
   reportedViewReadFailure: boolean;
   /**
+   * The highest source sequence bb has folded, from push or from a page. View
+   * cursors are opaque and cannot be compared, but every sourced view event
+   * carries the source record it came from — which is ordered, and is what
+   * makes a re-read from the start of the view safe to run.
+   */
+  deliveredThroughSequence: number;
+  /**
    * Consecutive reads that came back with nothing while a turn was open. One is
    * a slow model call; a long run of them is a session that has stopped.
    */
@@ -185,6 +192,7 @@ export function createRuntime(args: {
     reconciling: false,
     reportedViewGap: false,
     reportedViewReadFailure: false,
+    deliveredThroughSequence: 0,
     quietReconciles: 0,
     turnsOpened: 0,
     closing: false,

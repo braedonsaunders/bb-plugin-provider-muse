@@ -76,6 +76,7 @@ afterEach(async () => {
   delete process.env.FAKE_MUSE_RESUME_BROKEN;
   delete process.env.BB_MUSE_VIEW_ABANDON_READS;
   delete process.env.FAKE_MUSE_SESSION_STOPPED;
+  delete process.env.FAKE_MUSE_LONG_COMMAND;
   rmSync(workspaceDir, { recursive: true, force: true });
 });
 
@@ -419,4 +420,50 @@ it("never reports a prompt done when Muse said it started a turn", async () => {
         !delta.providerTurnId.startsWith("zero-work"),
     ),
   ).toBeDefined();
+});
+
+/**
+ * The regression that killed live work three times.
+ *
+ * `view/page` folds a view for a run that may still be going, and it reports an
+ * unfinished run as `incomplete` — which is not one of MSP's terminals
+ * (`completed | failed | cancelled`). Treating it as one ends a turn that is
+ * working perfectly well. Observed on a four-minute foreground GPU command:
+ * the read fired, folded `incomplete`, and bb reported the turn failed while
+ * Muse's own log had recorded no terminal at all and went on writing.
+ */
+it("does not end a working turn because a page folded it unfinished", async () => {
+  process.env.FAKE_MUSE_LONG_COMMAND = "1";
+  /** Isolate the fold: the abandon path is a separate decision, tested above. */
+  process.env.BB_MUSE_VIEW_ABANDON_READS = "100000";
+  const deltas = await runTurn(3_000);
+  delete process.env.FAKE_MUSE_LONG_COMMAND;
+  delete process.env.BB_MUSE_VIEW_ABANDON_READS;
+
+  expect(
+    deltas.filter((delta) => delta.kind === "turn.boundary"),
+  ).toEqual([]);
+  expect(
+    deltas.filter(
+      (delta) =>
+        delta.kind === "provider.error" &&
+        String(delta.detail).includes("incomplete"),
+    ),
+  ).toEqual([]);
+});
+
+/**
+ * A re-read from the start of the view must not re-deliver what push already
+ * showed. Before this, a refused anchor sent the reconcile back to the
+ * beginning and replayed the whole session underneath the live turn — forty
+ * duplicated command rows on one thread.
+ */
+it("never folds the same source record twice", async () => {
+  process.env.FAKE_MUSE_VIEW_BAD_ANCHOR = "1";
+  const deltas = await runTurn();
+  delete process.env.FAKE_MUSE_VIEW_BAD_ANCHOR;
+
+  const opens = deltas.filter((delta) => delta.kind === "item.open");
+  const keys = opens.map((delta) => JSON.stringify(delta.key));
+  expect(new Set(keys).size).toBe(keys.length);
 });
