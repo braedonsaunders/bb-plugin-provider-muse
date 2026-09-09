@@ -52,7 +52,7 @@ sessions.
 | BB | Muse |
 | --- | --- |
 | `thread/start` / `resume` / `fork` | `session/start` / `session/resume` / `session/fork` |
-| `turn/start`, `turn/steer` | `turn/start`, `turn/steer` (injected into the running turn) |
+| `turn/start`, `turn/steer` | `turn/start`, `turn/steer` (queued, applied at the turn boundary) |
 | `thread/stop { interrupt }` | `turn/interrupt`, settled before the stop is answered |
 | permission mode `full` | approval mode `allowAll`, Muse's sandbox off |
 | permission mode `auto` (bb reviews) | approval mode `allowAll`, sandbox on |
