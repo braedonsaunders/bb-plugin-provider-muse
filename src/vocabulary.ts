@@ -77,10 +77,8 @@ export function museApprovalMode(policy: {
 }
 
 /**
- * Muse Code offers four efforts — low, medium, high, x-high — and defaults to
- * high. MSP's wire enum is wider than the product's picker, so BB levels above
- * x-high land on x-high rather than selecting a tier the user cannot pick, and
- * `none` takes the lowest offered tier.
+ * Preserve Muse's native max and ultra efforts on the wire. The default stays
+ * high; foreign aliases retain their existing compatibility mappings.
  */
 export const MUSE_REASONING_EFFORTS = {
   none: "low",
@@ -88,12 +86,12 @@ export const MUSE_REASONING_EFFORTS = {
   medium: "medium",
   high: "high",
   xhigh: "xhigh",
-  max: "xhigh",
-  ultra: "xhigh",
+  max: "max",
+  ultra: "ultra",
   ultracode: "xhigh",
 } as const;
 
-export const MUSE_REASONING_LEVELS = ["low", "medium", "high", "xhigh"] as const;
+export const MUSE_REASONING_LEVELS = ["low", "medium", "high", "xhigh", "max", "ultra"] as const;
 
 export const MUSE_DEFAULT_REASONING_LEVEL = "high";
 
