@@ -7,6 +7,7 @@
  */
 import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
+import { existsSync, writeFileSync } from "node:fs";
 
 const sessions = new Map();
 let cursor = 0;
@@ -20,9 +21,29 @@ let cursor = 0;
 const poisonedSessionId = process.env.FAKE_MUSE_POISONED_SESSION ?? null;
 /** Poisons the replacement too, so a rerun that cannot work is scriptable. */
 const poisonEverySession = process.env.FAKE_MUSE_POISON_ALL === "1";
+/**
+ * Scripts a fault that poisons this process rather than the session: `mcp` for
+ * the MCP audit Muse loses to compaction, `eventLog` for an id conflict that
+ * refuses the submit itself. Only the first process to start is faulty — the
+ * marker file records that it ran — so a rebuild on a fresh process recovers.
+ */
+const runtimeFaultKind = process.env.FAKE_MUSE_RUNTIME_FAULT ?? null;
+const runtimeFaultMarker = process.env.FAKE_MUSE_RUNTIME_FAULT_MARKER ?? null;
+const runtimeFaulted =
+  runtimeFaultKind !== null &&
+  runtimeFaultMarker !== null &&
+  !existsSync(runtimeFaultMarker);
+if (runtimeFaulted) {
+  writeFileSync(runtimeFaultMarker, String(process.pid));
+}
+/** A healthy stored session, named by id, that every process can resume. */
+const storedSessionId = process.env.FAKE_MUSE_STORED_SESSION ?? null;
 /** A stored session, named by id, that resumes holding an unanswered approval. */
 const pendingApprovalSessionId =
   process.env.FAKE_MUSE_PENDING_APPROVAL ?? null;
+if (storedSessionId !== null) {
+  sessions.set(storedSessionId, { turns: 0, poisoned: false });
+}
 if (pendingApprovalSessionId !== null) {
   sessions.set(pendingApprovalSessionId, { turns: 0, poisoned: false });
 }
@@ -705,6 +726,41 @@ function handle(message) {
         return;
       }
       const turnId = params.commandId;
+      if (runtimeFaulted && runtimeFaultKind === "eventLog") {
+        fail(
+          -32603,
+          "turn/start runtime submit failed: event log failed: event id 615111f1-7082-5bc0-8284-79e4807e6a3c conflicts with an existing event",
+          { kind: "internal" },
+        );
+        return;
+      }
+      if (runtimeFaulted && runtimeFaultKind === "mcp") {
+        sendBurst([
+          {
+            jsonrpc: "2.0",
+            id,
+            result: {
+              commandId: params.commandId,
+              turnId,
+              disposition: "started",
+              startedNewTurn: true,
+              status: "accepted",
+            },
+          },
+          viewMessage(sessionId, "turn/started", { turnId, commandId: turnId }),
+          viewMessage(sessionId, "turn/completed", {
+            turnId,
+            terminal: "failed",
+            error: {
+              kind: "configError",
+              message:
+                "invalid run configuration: MCP startup audit failed; MCP is disabled for this runtime",
+              retryable: false,
+            },
+          }),
+        ]);
+        return;
+      }
       const promptText = (params.input ?? [])
         .filter((part) => part.type === "text")
         .map((part) => part.text)

@@ -119,7 +119,10 @@ const EXECUTION_OPTIONS = {
   permissionEscalation: "ask",
 } as const;
 
-async function resumeThread(threadId: string): Promise<void> {
+async function resumeThread(
+  threadId: string,
+  providerThreadId: string = POISONED_SESSION_ID,
+): Promise<void> {
   harness.sendRequest(1, "initialize", {
     protocolVersion: 1,
     client: { name: "bb", version: "1" },
@@ -128,7 +131,7 @@ async function resumeThread(threadId: string): Promise<void> {
   harness.sendRequest(2, "thread/resume", {
     threadId,
     cwd: workspaceDir,
-    providerThreadId: POISONED_SESSION_ID,
+    providerThreadId,
     instructionMode: "append",
     options: { ...EXECUTION_OPTIONS, instructions: INSTRUCTIONS },
   });
@@ -257,3 +260,81 @@ it("gives up after one rerun rather than looping on a prompt", async () => {
     delete process.env.FAKE_MUSE_POISON_ALL;
   }
 }, 45_000);
+
+/**
+ * A fault in the running `muse serve` rather than in the session: once Muse
+ * disables MCP for a process, or its event log refuses a submit, every turn on
+ * that process fails. Resuming the same session on a fresh process clears it,
+ * so the bridge rebuilds without dropping history and runs the prompt again —
+ * whether Muse failed the turn or refused the command outright.
+ */
+it.each([
+  ["mcp", "Muse disabled MCP"],
+  ["eventLog", "event log refused the turn"],
+])(
+  "resumes on a fresh process and reruns after a %s runtime fault",
+  async (kind, reason) => {
+    const storedSessionId = randomUUID();
+    process.env.FAKE_MUSE_RUNTIME_FAULT = kind;
+    process.env.FAKE_MUSE_RUNTIME_FAULT_MARKER = join(workspaceDir, "faulted");
+    process.env.FAKE_MUSE_STORED_SESSION = storedSessionId;
+    try {
+      const threadId = `thr_${randomUUID().slice(0, 8)}`;
+      await resumeThread(threadId, storedSessionId);
+
+      harness.sendRequest(3, "turn/start", {
+        threadId,
+        providerThreadId: storedSessionId,
+        clientRequestId: "creq_cdefghjkmn",
+        input: [{ type: "text", text: PROMPT }],
+        options: EXECUTION_OPTIONS,
+      });
+      await harness.waitForResponse(3);
+
+      const collected = await drain((seen) =>
+        seen.some((delta) => JSON.stringify(delta).includes("muse echo:")),
+      );
+
+      expect(countRerunWarnings(collected)).toBe(1);
+      const warning = collected.find(
+        (delta) =>
+          delta.kind === "provider.warning" &&
+          String(delta.summary).includes("running it again"),
+      );
+      expect(String(warning?.details)).toContain(reason);
+
+      /** The same session carries on: nothing is discarded to recover. */
+      expect(
+        collected.some(
+          (delta) =>
+            delta.kind === "provider.warning" &&
+            String(delta.summary).includes("fresh session"),
+        ),
+      ).toBe(false);
+      const identities = rawMessages
+        .map((message) => message as { method?: string; params?: unknown })
+        .filter((message) => message.method === "thread/identity")
+        .map(
+          (message) =>
+            (message.params as { providerThreadId?: string }).providerThreadId,
+        );
+      expect(identities.every((id) => id === storedSessionId)).toBe(true);
+
+      const echoed = collected
+        .map((delta) => JSON.stringify(delta))
+        .filter((text) => text.includes("muse echo:"))
+        .join("\n");
+      expect(echoed).toContain(PROMPT.slice(1, 40));
+
+      const accepted = collected.filter(
+        (delta) => delta.kind === "input.accepted",
+      );
+      expect(accepted).toHaveLength(1);
+    } finally {
+      delete process.env.FAKE_MUSE_RUNTIME_FAULT;
+      delete process.env.FAKE_MUSE_RUNTIME_FAULT_MARKER;
+      delete process.env.FAKE_MUSE_STORED_SESSION;
+    }
+  },
+  45_000,
+);

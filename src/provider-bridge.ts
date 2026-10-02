@@ -84,7 +84,7 @@ import {
 } from "./msp/schemas.js";
 import { uuidV7 } from "./msp/uuid.js";
 import { museProviderErrorInfo } from "./error-info.js";
-import { classifyTurnFailure } from "./recovery.js";
+import { classifyTurnFailure, runtimeFaultRestart } from "./recovery.js";
 import {
   constructionSignature,
   createRuntime,
@@ -2650,6 +2650,19 @@ async function submitTurn(args: {
         message,
         retryable: true,
       });
+    }
+
+    /**
+     * A runtime fault refuses the command itself, so it never reaches
+     * `onTurnCompleted`. Left alone, the same process refuses every turn that
+     * follows; rebuilt, it runs the prompt it just refused.
+     */
+    const restart = runtimeFaultRestart(message);
+    if (restart !== null) {
+      attachment.restartBeforeNextTurn = restart;
+      if (submitted !== null && !submitted.reran && !attachment.closing) {
+        void rerunFailedTurn(attachment, submitted, restart.reason);
+      }
     }
   }
 }

@@ -495,6 +495,19 @@ describe("turn failure classification", () => {
     ).toMatchObject({ kind: "rateLimited" });
   });
 
+  it("resumes on a fresh process when the running one is poisoned", async () => {
+    const { classifyTurnFailure } = await import("../src/recovery.js");
+    for (const message of [
+      "invalid run configuration: MCP startup audit failed; MCP is disabled for this runtime",
+      "turn/start runtime submit failed: event log failed: event id 615111f1-7082-5bc0-8284-79e4807e6a3c conflicts with an existing event",
+    ]) {
+      const classified = classifyTurnFailure(failed(message));
+      expect(classified.restart).toMatchObject({ fresh: false });
+      expect(classified.rerun).toBe(true);
+      expect(classified.hint).toBeNull();
+    }
+  });
+
   it("leaves an ordinary failure alone", async () => {
     const { classifyTurnFailure } = await import("../src/recovery.js");
     expect(classifyTurnFailure(failed("step limit exceeded"))).toEqual({

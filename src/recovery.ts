@@ -24,6 +24,35 @@ const INCOMPATIBLE_HISTORY_PATTERN =
  */
 const RETAINED_MEDIA_PATTERN = /retained media history is unsupported/i;
 
+/**
+ * Faults that poison the live `muse serve` process rather than the session.
+ * Muse disables MCP for the rest of a runtime once its startup audit cannot be
+ * validated — which compaction causes, by pruning the audit records out of the
+ * session log — and a runtime whose event log has diverged refuses every
+ * later submit with an id conflict. Either way every turn on that process
+ * fails in milliseconds, and a resume on a fresh process clears it.
+ */
+const RUNTIME_FAULTS: readonly { pattern: RegExp; reason: string }[] = [
+  {
+    pattern: /MCP startup audit failed|MCP is disabled for this runtime/i,
+    reason:
+      "Muse disabled MCP for its running process after a context compaction, so bb resumed the session on a fresh process",
+  },
+  {
+    pattern: /event log failed: .*conflicts with an existing event/i,
+    reason:
+      "Muse's event log refused the turn with an id conflict, so bb resumed the session on a fresh process",
+  },
+];
+
+/** The rebuild a runtime fault owes, or null when the message names none. */
+export function runtimeFaultRestart(
+  message: string,
+): { reason: string; fresh: false } | null {
+  const fault = RUNTIME_FAULTS.find(({ pattern }) => pattern.test(message));
+  return fault === undefined ? null : { reason: fault.reason, fresh: false };
+}
+
 export interface TurnFailureClassification {
   /** A rebuild is owed before the next turn. */
   restart: { reason: string; fresh: boolean } | null;
@@ -67,6 +96,11 @@ export function classifyTurnFailure(
       rerun: true,
       hint: null,
     };
+  }
+
+  const runtimeFault = runtimeFaultRestart(message);
+  if (runtimeFault !== null) {
+    return { restart: runtimeFault, rerun: true, hint: null };
   }
 
   if (INCOMPATIBLE_HISTORY_PATTERN.test(message)) {
