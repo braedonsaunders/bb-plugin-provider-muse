@@ -83,6 +83,10 @@ import {
   type MspUserInputRequestParams,
 } from "./msp/schemas.js";
 import { uuidV7 } from "./msp/uuid.js";
+import {
+  createMuseUsageStore,
+  MUSE_USAGE_CHANGED_METHOD,
+} from "./subscription-usage.js";
 import { museProviderErrorInfo } from "./error-info.js";
 import { classifyTurnFailure } from "./recovery.js";
 import {
@@ -245,6 +249,9 @@ const attachmentsBySessionId = new Map<string, MuseAttachment>();
 let runtimeSerialCounter = 0;
 
 let bridgeDataDir: string | null = null;
+const subscriptionUsage = createMuseUsageStore(() =>
+  bridgeDataDir === null ? null : join(bridgeDataDir, "subscription-usage.json"),
+);
 let toolProxy: ToolProxyEndpoint | null = null;
 let toolProxyScriptPath: string | null = null;
 let maintenanceConnection: MspConnection | null = null;
@@ -1391,6 +1398,15 @@ function handleChildNotification(
   method: string,
   params: unknown,
 ): void {
+  /**
+   * The plan's meters belong to the account, not to a session: the reading
+   * carries no session id, and one from a host that is shutting down is as true
+   * as one from a live turn.
+   */
+  if (method === MUSE_USAGE_CHANGED_METHOD) {
+    subscriptionUsage.record(params);
+    return;
+  }
   const runtime = liveRuntime(threadId, serial);
   const attachment = attachments.get(threadId);
   if (runtime === null || attachment === undefined) {
@@ -2899,6 +2915,7 @@ const handlers: Record<string, RequestHandler> = {
       await getMuseProviderUsage({
         tokenBudget: options.tokenBudget ?? null,
         planLabel: options.planLabel ?? null,
+        subscription: await subscriptionUsage.latest(),
       }),
     );
   },

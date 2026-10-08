@@ -487,6 +487,23 @@ function runTurn(sessionId, turnId, promptText) {
     },
     cumulative: { promptTokens: 120, outputTokens: 20, totalTokens: 140 },
   });
+  /**
+   * Real Muse pushes the plan's meters, outside any session's view, the first
+   * time a host sees a model response and whenever they move.
+   */
+  notify("usage/changed", {
+    window: {
+      usedPercent: 12,
+      windowDurationMins: 300,
+      resetsAtMs: Date.now() + 4 * 60 * 60 * 1_000,
+    },
+    weekly: {
+      usedPercent: 40,
+      resetsAtMs: Date.now() + 3 * 24 * 60 * 60 * 1_000,
+    },
+    tier: "fake-tier",
+    observedAtMs: Date.now(),
+  });
   viewNotify(sessionId, "session/contextUsage", {
     usedTokens: 140,
     windowTokens: 1_048_576,

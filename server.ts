@@ -36,7 +36,7 @@ export default function plugin(bb: BbPluginApi) {
       type: "string",
       label: `Rolling ${MUSE_USAGE_WINDOW_HOURS}-hour token budget`,
       description:
-        "Tokens your Muse plan allows per rolling window. Meta publishes no usage endpoint for Muse subscriptions, so BB measures the window from Muse's own session logs and needs this number for the denominator. Leave empty to show the account without a meter.",
+        "Only used before Muse reports your plan's own meters. Muse 1.4 and later sends the real 5-hour and weekly usage with every model response, and BB shows those as soon as one Muse turn has run. Until then — or on an older Muse — BB measures the window from Muse's session logs against this many tokens. Leave empty to show no meter until Muse reports one.",
       default: "",
     },
     planLabel: {

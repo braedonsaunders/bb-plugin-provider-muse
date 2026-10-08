@@ -418,7 +418,7 @@ the installer for you.
 
 | Setting | Meaning |
 | --- | --- |
-| Rolling 5-hour token budget | Tokens your plan allows per rolling window. Enables the usage meter. |
+| Rolling 5-hour token budget | Fallback denominator for the log-measured meter, used only until Muse reports the plan's own meters. |
 | Plan label | How the subscription is labelled in usage surfaces. |
 | Load workspace skills and rules | Starts sessions with the workspace trusted. |
 | Muse's own OS sandbox | `off` by default — see below. |
@@ -426,19 +426,41 @@ the installer for you.
 
 ## Usage reporting
 
-Meta publishes no usage endpoint for a Muse Code subscription. Verified against
-the live API: `GET /v1/usage` answers 404 even with a valid key, `GET /v1/models`
-carries no `x-ratelimit-*` headers, and the documented quota headers belong to
-the Model API's pay-as-you-go surface — a separate billing account from the Muse
-Code plan (an inference call on a subscription-less key answers
-`402 billing_not_configured`). This plugin therefore measures the rolling window
-from Muse's own durable session logs
+Muse Code 1.4 reports the plan's own meters over MSP. Every `muse serve` pushes
+`usage/changed` the first time it sees a model response and whenever the
+numbers move:
+
+```json
+{
+  "window": { "usedPercent": 0, "windowDurationMins": 300, "resetsAtMs": 1791520983000 },
+  "weekly": { "usedPercent": 40, "resetsAtMs": 1791763200000 },
+  "tier": "27681631238169137",
+  "observedAtMs": 1791502984748
+}
+```
+
+The bridge keeps the newest reading from any thread's host — in memory and in
+`subscription-usage.json` under the plugin's data directory, so a restarted
+bridge still has it — and reports it to bb as two windows: the **5-hour limit**
+and the **weekly limit**, with Meta's own percentages and reset times. Those
+are what BB's usage surfaces (and plugins built on `system.usageLimits`, such as
+Provider Usage) show for Muse.
+
+A reading describes the last response a host received, never a live poll: a
+fresh `muse serve` that has made no model call reports nothing, and there is no
+request that reads the meters without spending quota. So the bridge never
+probes. A reading that outlives its window is reported as unspent — the 5-hour
+block with its reset unknown until the next request opens one, the weekly block
+rolled forward to its next fixed boundary.
+
+Before the first Muse turn on a machine, or on a Muse build older than 1.4, there
+is no reading. The plugin then falls back to measuring the rolling window from
+Muse's durable session logs
 (`~/.local/share/muse/sessions/<date>/<session>/session.jsonl`), where every
-model completion records verbatim provider counters. That is a measurement, not
-an estimate — but the *denominator* is yours to supply: without a configured
-budget the provider reports the account with no meter rather than inventing a
-limit. When Muse's provider actually refuses a call for quota, the durable
-record carries the plan's own `resets_at`, and that wins over the local
+model completion records verbatim provider counters, against the configured
+token budget. Without a budget the account is shown with no meter rather than
+an invented limit. When Muse's provider actually refuses a call for quota, the
+durable record carries the plan's own `resets_at`, and that wins over the local
 estimate.
 
 ## Development

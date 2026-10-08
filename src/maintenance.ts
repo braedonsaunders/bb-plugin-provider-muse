@@ -19,6 +19,10 @@ import {
   museSessionsDir,
 } from "./msp/paths.js";
 import {
+  museUsageWindows,
+  type MuseSubscriptionUsage,
+} from "./subscription-usage.js";
+import {
   rollingWindowResetsAt,
   scanMuseUsage,
 } from "./usage-scan.js";
@@ -198,17 +202,21 @@ export interface MuseUsageArgs {
   nowMs?: number;
   tokenBudget?: number | null;
   planLabel?: string | null;
+  /** The newest `usage/changed` reading any Muse host has reported. */
+  subscription?: MuseSubscriptionUsage | null;
 }
 
 /**
- * Meta publishes no usage endpoint for a Muse Code subscription — `/v1/usage` is
- * a 404 even authenticated, and the Model API's `x-ratelimit-*` headers describe
- * that separate pay-as-you-go surface rather than the plan. So the window is
- * measured from Muse's own session logs, and the plan's own `resets_at` is used
- * whenever the provider has actually refused a call for quota.
+ * Muse 1.4 reports the plan's own meters — the 5-hour block and the weekly
+ * block, as Meta counts them — on every model response, and the bridge keeps
+ * the newest one. That reading is the usage whenever one exists.
  *
- * Without a configured budget there is no honest denominator, and an unlimited
- * result carries the account with no window rather than an invented percentage.
+ * Before the first Muse turn on this machine, or on a Muse build that predates
+ * `usage/changed`, there is no reading. The window is then measured from
+ * Muse's own session logs against a configured budget, and the plan's own
+ * `resets_at` is used whenever the provider has actually refused a call for
+ * quota. Without a budget there is no honest denominator, and the account is
+ * shown with no window rather than an invented percentage.
  */
 export async function getMuseProviderUsage(
   args: MuseUsageArgs = {},
@@ -228,6 +236,17 @@ export async function getMuseProviderUsage(
   }
 
   const planLabel = args.planLabel ?? credentials.planLabel;
+  if (args.subscription) {
+    return {
+      supported: true,
+      usage: {
+        status: "ok",
+        accountEmail: credentials.accountEmail,
+        planLabel,
+        windows: museUsageWindows(args.subscription, nowMs),
+      },
+    };
+  }
   const budget = args.tokenBudget ?? null;
   if (budget === null) {
     return {

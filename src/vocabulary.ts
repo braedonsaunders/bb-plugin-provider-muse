@@ -25,9 +25,9 @@ export const MUSE_ICON_GLYPH = `${MUSE_PLUGIN_ID}/muse`;
 export const MUSE_WORKFLOW_ICON_GLYPH = `${MUSE_PLUGIN_ID}/workflow`;
 
 /**
- * Meta rate-limits Muse subscriptions on a rolling window and publishes no
- * usage endpoint, so the plugin measures that window itself from Muse's own
- * durable session logs.
+ * The rolling window measured from Muse's own session logs when no host has
+ * reported the plan's meters yet: before the first Muse turn on a machine, or
+ * on a Muse build older than 1.4, which predates `usage/changed`.
  */
 export const MUSE_USAGE_WINDOW_HOURS = 5;
 
