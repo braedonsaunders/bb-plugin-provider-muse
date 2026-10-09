@@ -35,10 +35,10 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "zod": "^4.3.6"
+    "zod": "^4.3.6",
+    "@get-bb/plugin-sdk": "0.5.9"
   },
   "devDependencies": {
-    "@get-bb/plugin-sdk": "0.5.9",
     "@types/node": "^22.0.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
