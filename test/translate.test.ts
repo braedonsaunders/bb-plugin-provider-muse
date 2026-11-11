@@ -471,6 +471,18 @@ describe("turn failure classification", () => {
     error: { kind: "modelError", message, retryable: false },
   });
 
+  it("asks for a fresh session when upstream model route or session is lost", async () => {
+    const { classifyTurnFailure } = await import("../src/recovery.js");
+    const classified = classifyTurnFailure(
+      failed(
+        "model `muse-ember-1.0` does not exist or you lack access [request_id=dde786a0-e6b8-40a0-ae74-c1debbb983df]",
+      ),
+    );
+    expect(classified.restart).toMatchObject({ fresh: true });
+    expect(classified.rerun).toBe(true);
+    expect(classified.hint).toBeNull();
+  });
+
   it("asks for a fresh session when Muse cannot replay its own history", async () => {
     const { classifyTurnFailure } = await import("../src/recovery.js");
     const classified = classifyTurnFailure(
@@ -486,6 +498,13 @@ describe("turn failure classification", () => {
   it("types an expired login and a rate limit for bb to act on", async () => {
     const { classifyTurnFailure } = await import("../src/recovery.js");
     const auth = classifyTurnFailure(failed("request failed: 401 unauthorized"));
+    const notLoggedIn = classifyTurnFailure(failed("not logged in: run /login to add an API key"));
+    expect(notLoggedIn.hint).toMatchObject({ kind: "authRequired" });
+    expect(notLoggedIn.restart).toEqual({
+      reason: "Muse session restarted after an authentication failure",
+      fresh: true,
+    });
+    expect(notLoggedIn.rerun).toBe(false);
     expect(auth.hint).toMatchObject({ kind: "authRequired" });
     /** A new session does not clear an expired login, so nothing is rerun. */
     expect(auth.rerun).toBe(false);

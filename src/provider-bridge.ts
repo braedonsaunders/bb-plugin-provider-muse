@@ -383,7 +383,7 @@ function postureFrom(
 }
 
 function serveArgs(posture: HostPosture): string[] {
-  const args = ["serve"];
+  const args = ["serve", "--provider", "meta"];
   if (posture.disableSandbox) {
     args.push("--disable-sandbox");
   } else {

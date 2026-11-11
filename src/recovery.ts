@@ -10,7 +10,7 @@ import { mspTurnCompletedParamsSchema } from "./msp/schemas.js";
  */
 
 const AUTH_PATTERN =
-  /\b(?:40[13]|unauthori[sz]ed|authentication failed|oauth|not authenticated|sign[- ]?in)\b/i;
+  /\b(?:40[13]|unauthori[sz]ed|authentication failed|oauth|not authenticated|sign[- ]?in|not logged in|add an api key|run \/login)\b/i;
 const RATE_LIMIT_PATTERN =
   /\b(?:429|rate[-\s]?limit(?:ed)?|quota|usage limit|resets_at|billing)\b/i;
 const INCOMPATIBLE_HISTORY_PATTERN =
@@ -23,6 +23,8 @@ const INCOMPATIBLE_HISTORY_PATTERN =
  * not there, and hides the one thing that stops it recurring.
  */
 const RETAINED_MEDIA_PATTERN = /retained media history is unsupported/i;
+const ROUTE_OR_MODEL_LOST_PATTERN =
+  /model `.*` does not exist or you lack access|model_not_found|ModelNotFound|\b404\b/i;
 
 export interface TurnFailureClassification {
   /** A rebuild is owed before the next turn. */
@@ -81,11 +83,23 @@ export function classifyTurnFailure(
     };
   }
 
+  if (ROUTE_OR_MODEL_LOST_PATTERN.test(message)) {
+    return {
+      restart: {
+        reason:
+          "Muse upstream model route or session was lost, so bb started a fresh session",
+        fresh: true,
+      },
+      rerun: true,
+      hint: null,
+    };
+  }
+
   if (AUTH_PATTERN.test(message)) {
     return {
       restart: {
         reason: "Muse session restarted after an authentication failure",
-        fresh: false,
+        fresh: true,
       },
       rerun: false,
       hint: { kind: "authRequired", message, retryable: false },
