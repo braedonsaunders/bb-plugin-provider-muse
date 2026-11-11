@@ -35,7 +35,7 @@ const STREAM_PATTERN =
 const INTERNAL_PATTERN =
   /\b(?:500|502|504)\b|internal server error|bad gateway|gateway timeout/i;
 const BAD_REQUEST_PATTERN =
-  /\b400\b|invalid request|unsupported (?:model|parameter)|unknown model/i;
+  /\b40[04]\b|invalid request|unsupported (?:model|parameter)|unknown model|does not exist or you lack access|model_not_found/i;
 
 /**
  * Only a status the message names as one. `429` beside the word `status` or

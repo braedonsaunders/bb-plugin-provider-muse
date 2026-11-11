@@ -471,6 +471,18 @@ describe("turn failure classification", () => {
     error: { kind: "modelError", message, retryable: false },
   });
 
+  it("asks for a fresh session when upstream model route or session is lost", async () => {
+    const { classifyTurnFailure } = await import("../src/recovery.js");
+    const classified = classifyTurnFailure(
+      failed(
+        "model `muse-ember-1.0` does not exist or you lack access [request_id=dde786a0-e6b8-40a0-ae74-c1debbb983df]",
+      ),
+    );
+    expect(classified.restart).toMatchObject({ fresh: true });
+    expect(classified.rerun).toBe(true);
+    expect(classified.hint).toBeNull();
+  });
+
   it("asks for a fresh session when Muse cannot replay its own history", async () => {
     const { classifyTurnFailure } = await import("../src/recovery.js");
     const classified = classifyTurnFailure(

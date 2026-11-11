@@ -23,6 +23,8 @@ const INCOMPATIBLE_HISTORY_PATTERN =
  * not there, and hides the one thing that stops it recurring.
  */
 const RETAINED_MEDIA_PATTERN = /retained media history is unsupported/i;
+const ROUTE_OR_MODEL_LOST_PATTERN =
+  /model `.*` does not exist or you lack access|model_not_found|ModelNotFound|\b404\b/i;
 
 export interface TurnFailureClassification {
   /** A rebuild is owed before the next turn. */
@@ -74,6 +76,18 @@ export function classifyTurnFailure(
       restart: {
         reason:
           "Muse could not replay this session's reasoning history after its route changed, so bb started a fresh session",
+        fresh: true,
+      },
+      rerun: true,
+      hint: null,
+    };
+  }
+
+  if (ROUTE_OR_MODEL_LOST_PATTERN.test(message)) {
+    return {
+      restart: {
+        reason:
+          "Muse upstream model route or session was lost, so bb started a fresh session",
         fresh: true,
       },
       rerun: true,
