@@ -19,7 +19,7 @@ import type {
  */
 
 const AUTH_PATTERN =
-  /\b(?:40[13]|unauthori[sz]ed|authentication failed|oauth|not authenticated|sign[- ]?in|invalid api key|expired token)\b/i;
+  /\b(?:40[13]|unauthori[sz]ed|authentication failed|oauth|not authenticated|sign[- ]?in|invalid api key|expired token|not logged in|add an api key|run \/login)\b/i;
 const BILLING_PATTERN =
   /\b(?:402|billing|payment required|insufficient (?:credit|funds|balance))\b/i;
 const RATE_LIMIT_PATTERN =

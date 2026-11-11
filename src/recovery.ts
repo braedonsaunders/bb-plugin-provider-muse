@@ -10,7 +10,7 @@ import { mspTurnCompletedParamsSchema } from "./msp/schemas.js";
  */
 
 const AUTH_PATTERN =
-  /\b(?:40[13]|unauthori[sz]ed|authentication failed|oauth|not authenticated|sign[- ]?in)\b/i;
+  /\b(?:40[13]|unauthori[sz]ed|authentication failed|oauth|not authenticated|sign[- ]?in|not logged in|add an api key|run \/login)\b/i;
 const RATE_LIMIT_PATTERN =
   /\b(?:429|rate[-\s]?limit(?:ed)?|quota|usage limit|resets_at|billing)\b/i;
 const INCOMPATIBLE_HISTORY_PATTERN =
@@ -99,7 +99,7 @@ export function classifyTurnFailure(
     return {
       restart: {
         reason: "Muse session restarted after an authentication failure",
-        fresh: false,
+        fresh: true,
       },
       rerun: false,
       hint: { kind: "authRequired", message, retryable: false },

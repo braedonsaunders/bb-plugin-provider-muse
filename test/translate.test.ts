@@ -498,6 +498,13 @@ describe("turn failure classification", () => {
   it("types an expired login and a rate limit for bb to act on", async () => {
     const { classifyTurnFailure } = await import("../src/recovery.js");
     const auth = classifyTurnFailure(failed("request failed: 401 unauthorized"));
+    const notLoggedIn = classifyTurnFailure(failed("not logged in: run /login to add an API key"));
+    expect(notLoggedIn.hint).toMatchObject({ kind: "authRequired" });
+    expect(notLoggedIn.restart).toEqual({
+      reason: "Muse session restarted after an authentication failure",
+      fresh: true,
+    });
+    expect(notLoggedIn.rerun).toBe(false);
     expect(auth.hint).toMatchObject({ kind: "authRequired" });
     /** A new session does not clear an expired login, so nothing is rerun. */
     expect(auth.rerun).toBe(false);
